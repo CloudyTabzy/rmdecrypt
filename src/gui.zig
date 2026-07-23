@@ -35,6 +35,36 @@ fn appendLog(gpa: std.mem.Allocator, s: *GuiState, comptime fmt: []const u8, arg
     s.log.append(gpa, LogEntry{ .msg = msg, .err = err }) catch {};
 }
 
+/// Returns `text` unchanged if it fits within `max_width` at `font`'s natural
+/// size, otherwise returns a slice of `buf` containing the truncated text
+/// followed by "...". Falls back to `text` if formatting fails.
+fn ellipsizeToFit(text: []const u8, max_width: f32, font: dvui.Font, buf: []u8) []const u8 {
+    const full_size = font.textSize(text);
+    if (full_size.w <= max_width) return text;
+
+    const ellipsis = "...";
+    const ellipsis_w = font.textSize(ellipsis).w;
+    const avail = @max(20.0, max_width - ellipsis_w - 2.0);
+
+    var end_idx: usize = 0;
+    _ = font.textSizeEx(text, .{
+        .max_width = avail,
+        .end_idx = &end_idx,
+    });
+    if (end_idx == 0) return text;
+    return std.fmt.bufPrint(buf, "{s}...", .{text[0..end_idx]}) catch text;
+}
+
+/// Estimate the width available to a horizontally-expanded textEntry that
+/// sits inside a card row with: icon (~34px) + label (~110px) + spacer (6px)
+/// + trailing button (~106px), plus window/card padding & borders.
+fn estimatePathEntryWidth() f32 {
+    const win_w = dvui.currentWindow().data().contentRect().w;
+    // window margin 14*2 + card padding 14*2 + card border 2 + sibling widths
+    const fixed_w: f32 = 28.0 + 28.0 + 2.0 + 34.0 + 110.0 + 6.0 + 106.0;
+    return @max(20.0, win_w - fixed_w);
+}
+
 /// Card-style section with subtle border, rounded corners, and a header.
 /// Use via: `var c = card(@src(), "Title"); defer c.deinit(); ...content...`
 const Card = struct {
@@ -99,11 +129,16 @@ fn pathRow(
         .font = dvui.Font.theme(.heading),
         .id_extra = row_id + 2,
     });
-    // Text entry
+    // Text entry (with ellipsized placeholder when the textbox is squished)
     {
+        const font = dvui.Font.theme(.body);
+        var placeholder_buf: [64]u8 = undefined;
+        const avail_w = estimatePathEntryWidth();
+        const full_placeholder = if (is_output) "output directory" else "path/to/game";
+        const placeholder = ellipsizeToFit(full_placeholder, avail_w, font, &placeholder_buf);
         const te = dvui.textEntry(src, .{
             .text = .{ .array_list = .{ .backing = text_buf, .allocator = gpa, .limit = TEXT_LIMIT } },
-            .placeholder = if (is_output) "output directory" else "path/to/game",
+            .placeholder = placeholder,
         }, .{ .expand = .horizontal, .id_extra = row_id + 3 });
         te.deinit();
     }
@@ -204,8 +239,8 @@ pub fn main(init: std.process.Init) !void {
     var backend = try SDL2Backend.initWindow(.{
         .io = init.io,
         .environ_map = init.environ_map,
-        .size = .{ .w = 820, .h = 680 },
-        .min_size = .{ .w = 680, .h = 520 },
+        .size = .{ .w = 1100, .h = 620 },
+        .min_size = .{ .w = 880, .h = 520 },
         .vsync = true,
         .title = "rmdecrypt v" ++ VERSION ++ " — RPG Maker MV/MZ Asset Tool",
     });
@@ -288,9 +323,13 @@ pub fn main(init: std.process.Init) !void {
                     .id_extra = 10,
                 });
                 {
+                    const font = dvui.Font.theme(.body);
+                    var placeholder_buf: [64]u8 = undefined;
+                    const avail_w = estimatePathEntryWidth();
+                    const placeholder = ellipsizeToFit("auto-detect or 32-char hex key", avail_w, font, &placeholder_buf);
                     const te = dvui.textEntry(@src(), .{
                         .text = .{ .array_list = .{ .backing = &s.key_list, .allocator = gpa, .limit = TEXT_LIMIT } },
-                        .placeholder = "auto-detect or 32-char hex key",
+                        .placeholder = placeholder,
                     }, .{ .expand = .horizontal, .id_extra = 10 });
                     te.deinit();
                 }
