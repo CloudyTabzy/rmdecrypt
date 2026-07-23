@@ -37,9 +37,15 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "dvui", .module = dvui_dep.module("dvui_sdl2") },
                 .{ .name = "sdl2-backend", .module = dvui_dep.module("sdl2") },
+                .{ .name = "win32_folder_dialog", .module = b.createModule(.{
+                    .root_source_file = b.path("src/win32_folder_dialog.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }) },
             },
         }),
     });
+    if (target.result.os.tag == .windows) gui.root_module.linkSystemLibrary("ole32", .{});
     b.installArtifact(gui);
 
     const gui_run_step = b.step("gui", "Run the GUI");

@@ -5,6 +5,7 @@ const SDL2Backend = @import("sdl2-backend");
 const decrypter = @import("decrypter.zig");
 const extensions = @import("extensions.zig");
 const key_detect = @import("key_detect.zig");
+const win32_folder_dialog = @import("win32_folder_dialog");
 const Dir = std.Io.Dir;
 
 const VERSION = "0.1.0";
@@ -55,14 +56,21 @@ fn ellipsizeToFit(text: []const u8, max_width: f32, font: dvui.Font, buf: []u8) 
     return std.fmt.bufPrint(buf, "{s}...", .{text[0..end_idx]}) catch text;
 }
 
-/// Estimate the width available to a horizontally-expanded textEntry that
-/// sits inside a card row with: icon (~34px) + label (~110px) + spacer (6px)
-/// + trailing button (~106px), plus window/card padding & borders.
-fn estimatePathEntryWidth() f32 {
-    const win_w = dvui.currentWindow().data().contentRect().w;
-    // window margin 14*2 + card padding 14*2 + card border 2 + sibling widths
-    const fixed_w: f32 = 28.0 + 28.0 + 2.0 + 34.0 + 110.0 + 6.0 + 106.0;
-    return @max(20.0, win_w - fixed_w);
+/// Modern Windows Explorer-style folder picker. On Windows uses the COM
+/// IFileOpenDialog (the same dialog File Explorer uses); elsewhere falls
+/// back to dvui.dialogNativeFolderSelect. Returns null on cancel.
+fn showFolderPicker(gpa: std.mem.Allocator, title: []const u8) ?[]const u8 {
+    if (builtin.os.tag == .windows) {
+        if (win32_folder_dialog.selectFolder(gpa, title)) |maybe| {
+            if (maybe) |p| return p;
+            return null; // user cancelled
+        } else |_| {}
+    }
+    // Fallback to dvui's tinyfiledialogs wrapper
+    if (dvui.dialogNativeFolderSelect(gpa, .{ .title = title })) |maybe_p| {
+        if (maybe_p) |p| return p;
+    } else |_| {}
+    return null;
 }
 
 /// Card-style section with subtle border, rounded corners, and a header.
@@ -115,6 +123,20 @@ fn pathRow(
     var row = dvui.box(src, .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .y = 4 }, .id_extra = row_id });
     defer row.deinit();
 
+    // Use the row's actual contentRect (now allocated by parent layout) to
+    // measure how much horizontal space the textEntry will actually receive.
+    // Reserve space for the known siblings plus the textEntry's internal
+    // padding (6px left + 6px right = 12px from defaults).
+    const row_w = row.data().contentRect().w;
+    const body_font = dvui.Font.theme(.body);
+    const heading_font = dvui.Font.theme(.heading);
+    const icon_w: f32 = 18.0 + 8.0 * 2.0;
+    const label_w: f32 = @max(110.0, heading_font.textSize(label_str).w);
+    const spacer_w: f32 = 6.0;
+    const button_w: f32 = 90.0 + 8.0 * 2.0 + 6.0 * 2.0; // Browse: min + margin + padding
+    const textentry_internal_pad: f32 = 12.0; // 6 left + 6 right (defaults)
+    const avail_w = @max(20.0, row_w - icon_w - label_w - spacer_w - button_w - textentry_internal_pad);
+
     // Icon
     dvui.icon(src, label_str, icon_tvg, .{}, .{
         .min_size_content = .{ .h = 18, .w = 18 },
@@ -131,11 +153,9 @@ fn pathRow(
     });
     // Text entry (with ellipsized placeholder when the textbox is squished)
     {
-        const font = dvui.Font.theme(.body);
         var placeholder_buf: [64]u8 = undefined;
-        const avail_w = estimatePathEntryWidth();
         const full_placeholder = if (is_output) "output directory" else "path/to/game";
-        const placeholder = ellipsizeToFit(full_placeholder, avail_w, font, &placeholder_buf);
+        const placeholder = ellipsizeToFit(full_placeholder, avail_w, body_font, &placeholder_buf);
         const te = dvui.textEntry(src, .{
             .text = .{ .array_list = .{ .backing = text_buf, .allocator = gpa, .limit = TEXT_LIMIT } },
             .placeholder = placeholder,
@@ -149,21 +169,18 @@ fn pathRow(
         .style = .control,
         .id_extra = row_id + 5,
     })) {
-        if (dvui.dialogNativeFolderSelect(gpa, .{ .title = dialog_title })) |maybe_p| {
-            if (maybe_p) |p| {
-                defer gpa.free(p);
-                text_buf.clearRetainingCapacity();
-                text_buf.appendSlice(gpa, p) catch {};
-                if (auto_fill_output and !is_output) {
-                    // Mirror into output if empty
-                    if (state.output_list.items.len == 0) {
-                        state.output_list.clearRetainingCapacity();
-                        state.output_list.appendSlice(gpa, p) catch {};
-                        state.output_list.appendSlice(gpa, "_decrypted") catch {};
-                    }
+        if (showFolderPicker(gpa, dialog_title)) |p| {
+            defer gpa.free(p);
+            text_buf.clearRetainingCapacity();
+            text_buf.appendSlice(gpa, p) catch {};
+            if (auto_fill_output and !is_output) {
+                if (state.output_list.items.len == 0) {
+                    state.output_list.clearRetainingCapacity();
+                    state.output_list.appendSlice(gpa, p) catch {};
+                    state.output_list.appendSlice(gpa, "_decrypted") catch {};
                 }
             }
-        } else |_| {}
+        }
     }
 }
 
@@ -310,6 +327,17 @@ pub fn main(init: std.process.Init) !void {
                 var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .y = 4 }, .id_extra = 10 });
                 defer row.deinit();
 
+                // Measure row width and subtract known siblings + textEntry
+                // internal padding so the placeholder fits with ellipsis.
+                const row_w = row.data().contentRect().w;
+                const body_font = dvui.Font.theme(.body);
+                const icon_w: f32 = 18.0 + 8.0 * 2.0;
+                const label_w: f32 = @max(110.0, dvui.Font.theme(.heading).textSize("Key").w);
+                const spacer_w: f32 = 6.0;
+                const button_w: f32 = 120.0 + 8.0 * 2.0 + 6.0 * 2.0; // Auto-Detect
+                const textentry_internal_pad: f32 = 12.0;
+                const avail_w = @max(20.0, row_w - icon_w - label_w - spacer_w - button_w - textentry_internal_pad);
+
                 dvui.icon(@src(), "key_icon", dvui.entypo.key, .{}, .{
                     .min_size_content = .{ .h = 18, .w = 18 },
                     .gravity_y = 0.5,
@@ -323,10 +351,8 @@ pub fn main(init: std.process.Init) !void {
                     .id_extra = 10,
                 });
                 {
-                    const font = dvui.Font.theme(.body);
                     var placeholder_buf: [64]u8 = undefined;
-                    const avail_w = estimatePathEntryWidth();
-                    const placeholder = ellipsizeToFit("auto-detect or 32-char hex key", avail_w, font, &placeholder_buf);
+                    const placeholder = ellipsizeToFit("auto-detect or 32-char hex key", avail_w, body_font, &placeholder_buf);
                     const te = dvui.textEntry(@src(), .{
                         .text = .{ .array_list = .{ .backing = &s.key_list, .allocator = gpa, .limit = TEXT_LIMIT } },
                         .placeholder = placeholder,
