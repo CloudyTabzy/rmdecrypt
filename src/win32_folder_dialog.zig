@@ -233,67 +233,85 @@ const sh = struct {
     const BIF_DONTGOBELOWDOMAIN: u32 = 0x00000002;
     const BIF_NEWDIALOGSTYLE: u32 = 0x00000040;
     const BIF_EDITBOX: u32 = 0x00000010;
-    const BIF_NONEWFOLDERBUTTON: u32 = 0x0200;
+    const BIF_USENEWUI: u32 = 0x00000050; // = NEWDIALOGSTYLE | EDITBOX
 
-    const BFFM_INITIALDIRECTORY: u32 = 1;
-    const BFFM_SETSELECTION: u32 = 0x400 + 1;
+    const BFFM_INITIALIZED: u32 = 1;
+    const BFFM_SETSELECTIONW: u32 = 0x400 + 1;
 
-    const BROWSEINFO = extern struct {
+    // Use the WIDE version because we pass wide strings. The ANSI version
+    // (SHBrowseForFolder) maps to the wide version on Windows but
+    // explicit is better.
+    const BROWSEINFOW = extern struct {
         hwndOwner: ?HWND,
         pidlRoot: ?*ITEMIDLIST,
-        pszDisplayName: LPSTR, // output: MAX_PATH buffer
-        lpszTitle: LPCSTR, // title shown in the dialog
+        pszDisplayName: [*]u16, // output: MAX_PATH buffer
+        lpszTitle: [*:0]const u16, // title shown in the dialog
         ulFlags: u32,
         lpfn: ?*const fn (HWND, u32, LPARAM, LPARAM) callconv(.winapi) u32,
         lParam: LPARAM,
         iImage: i32,
     };
 
-    const LPSTR = [*:0]u8;
-    const LPCSTR = [*:0]const u8;
     const LPARAM = isize;
     const ITEMIDLIST = opaque {}; // pidl (unused on input; SHBrowseForFolder returns one)
 
-    extern "shell32" fn SHBrowseForFolder(lpbi: *const BROWSEINFO) callconv(.winapi) ?*ITEMIDLIST;
+    // user32 — get the foreground window so the dialog has a parent
+    // (the active SDL window). With NULL hwndOwner the dialog either
+    // appears off-screen or is dismissed immediately on some setups.
+    extern "user32" fn GetForegroundWindow() callconv(.winapi) ?HWND;
+    extern "user32" fn SendMessageW(hWnd: HWND, Msg: u32, wParam: usize, lParam: isize) callconv(.winapi) isize;
+    // shell32
+    extern "shell32" fn SHBrowseForFolderW(lpbi: *const BROWSEINFOW) callconv(.winapi) ?*ITEMIDLIST;
     extern "shell32" fn SHGetPathFromIDListW(pidl: *ITEMIDLIST, pszPath: [*]u16) callconv(.winapi) BOOL;
     extern "ole32" fn CoTaskMemFree(pv: ?*anyopaque) callconv(.winapi) void;
+
+    // Callback that sets the initial folder via BFFM_SETSELECTIONW.
+    fn browseCallback(hwnd: HWND, uMsg: u32, lp: LPARAM, pData: LPARAM) callconv(.winapi) u32 {
+        _ = lp;
+        if (uMsg == BFFM_INITIALIZED) {
+            // pData is LPARAM (wide-string pointer or 0 for default location).
+            _ = SendMessageW(hwnd, BFFM_SETSELECTIONW, 1, pData);
+        }
+        return 0;
+    }
 };
 
 fn selectFolderShell(alloc: std.mem.Allocator, title: ?[]const u8) !?[]u8 {
     if (builtin.mode == .Debug) {
-        std.debug.print("[folder_picker/shell] entering SHBrowseForFolder\n", .{});
+        std.debug.print("[folder_picker/shell] entering SHBrowseForFolderW\n", .{});
     }
 
-    // SHBrowseForFolder's lpszTitle is a *C string* (LPCSTR), not wide.
-    var title_buf: [256:0]u8 = undefined;
+    // Build wide-string title.
+    var title_buf: [256:0]u16 = undefined;
     @memset(title_buf[0..], 0);
-    const title_cstr: [*:0]const u8 = if (title) |t| blk: {
-        const len = @min(t.len, title_buf.len - 1);
-        @memcpy(title_buf[0..len], t[0..len]);
+    if (title) |t| {
+        const utf16 = try std.unicode.utf8ToUtf16LeAlloc(alloc, t);
+        defer alloc.free(utf16);
+        const len = @min(utf16.len, title_buf.len - 1);
+        @memcpy(title_buf[0..len], utf16[0..len]);
         title_buf[len] = 0;
-        break :blk @ptrCast(&title_buf);
-    } else @ptrCast(&title_buf);
+    }
 
-    var display_name: [260:0]u8 = undefined; // MAX_PATH
+    var display_name: [260:0]u16 = undefined; // MAX_PATH
     @memset(display_name[0..], 0);
 
-    var bi: sh.BROWSEINFO = .{
-        .hwndOwner = null,
+    var bi: sh.BROWSEINFOW = .{
+        .hwndOwner = sh.GetForegroundWindow(), // critical: gives the dialog a real parent
         .pidlRoot = null,
-        .pszDisplayName = @ptrCast(&display_name),
-        .lpszTitle = title_cstr,
-        .ulFlags = sh.BIF_RETURNONLYFSDIRS | sh.BIF_DONTGOBELOWDOMAIN | sh.BIF_NEWDIALOGSTYLE | sh.BIF_EDITBOX,
-        .lpfn = null,
+        .pszDisplayName = &display_name,
+        .lpszTitle = @ptrCast(&title_buf),
+        .ulFlags = sh.BIF_RETURNONLYFSDIRS | sh.BIF_DONTGOBELOWDOMAIN | sh.BIF_USENEWUI,
+        .lpfn = &sh.browseCallback, // set initial selection (null = start at default)
         .lParam = 0,
-        .iImage = 0,
+        .iImage = -1,
     };
 
     if (builtin.mode == .Debug) {
-        std.debug.print("[folder_picker/shell] calling SHBrowseForFolder (title_len={d})\n", .{title_buf.len});
+        std.debug.print("[folder_picker/shell] calling SHBrowseForFolderW hwndOwner={*} flags=0x{x}\n", .{ bi.hwndOwner, bi.ulFlags });
     }
-    const pidl = sh.SHBrowseForFolder(&bi);
+    const pidl = sh.SHBrowseForFolderW(&bi);
     if (builtin.mode == .Debug) {
-        std.debug.print("[folder_picker/shell] SHBrowseForFolder returned pidl={*}\n", .{pidl});
+        std.debug.print("[folder_picker/shell] SHBrowseForFolderW returned pidl={*}\n", .{pidl});
     }
     if (pidl == null) return null;
 
