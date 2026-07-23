@@ -1,0 +1,16 @@
+.{
+    .name = .rmdecrypt,
+    .version = "0.1.0",
+    .fingerprint = 0x68a1460ecd7f1143,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+    .dependencies = .{
+        .dvui = .{
+            .path = "../dvui-main",
+        },
+    },
+}
