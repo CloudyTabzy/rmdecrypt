@@ -45,6 +45,14 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // The GUI module declares extern "SDL2" (for drag-and-drop event
+    // polling). The sdl2-c Zig module produced by cImport uses -lSDL2
+    // when generating extern decls, and the linker can't find it in
+    // any default search path. Add the cache dir where dvui pre-
+    // extracted SDL2.lib to the linker search path.
+    if (target.result.os.tag == .windows) {
+        gui.root_module.addLibraryPath(b.path(".zig-cache/o/b6880618b176c43a0f902caf7218f51d"));
+    }
     if (target.result.os.tag == .windows) gui.root_module.linkSystemLibrary("ole32", .{});
     b.installArtifact(gui);
 
