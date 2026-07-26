@@ -287,12 +287,16 @@ static void
 heading(struct nk_context *ctx, unsigned icon, const char *text)
 {
     int p;
-    nk_layout_row_begin(ctx, NK_DYNAMIC, 28, 2);
-    nk_layout_row_push(ctx, 0.06f);
+    struct nk_rect content = nk_window_get_content_region(ctx);
+    float icon_w = content.w < 56.0f ? content.w * 0.25f : 28.0f;
+    float text_w = content.w - icon_w;
+    if (text_w < 1.0f) text_w = 1.0f;
+    nk_layout_row_begin(ctx, NK_STATIC, 28, 2);
+    nk_layout_row_push(ctx, icon_w);
     p = push_font(ctx, f_icons);
     nk_label_colored(ctx, ico(icon), NK_TEXT_LEFT, accent);
     if (p) nk_style_pop_font(ctx);
-    nk_layout_row_push(ctx, 0.94f);
+    nk_layout_row_push(ctx, text_w);
     p = push_font(ctx, f_bold);
     nk_label_colored(ctx, text, NK_TEXT_LEFT, heading_col);
     if (p) nk_style_pop_font(ctx);
@@ -305,12 +309,16 @@ status_line(struct nk_context *ctx, unsigned icon, const char *text,
             struct nk_color col)
 {
     int p;
-    nk_layout_row_begin(ctx, NK_DYNAMIC, 24, 2);
-    nk_layout_row_push(ctx, 0.06f);
+    struct nk_rect content = nk_window_get_content_region(ctx);
+    float icon_w = content.w < 56.0f ? content.w * 0.25f : 28.0f;
+    float text_w = content.w - icon_w;
+    if (text_w < 1.0f) text_w = 1.0f;
+    nk_layout_row_begin(ctx, NK_STATIC, 24, 2);
+    nk_layout_row_push(ctx, icon_w);
     p = push_font(ctx, f_icons);
     nk_label_colored(ctx, ico(icon), NK_TEXT_LEFT, col);
     if (p) nk_style_pop_font(ctx);
-    nk_layout_row_push(ctx, 0.94f);
+    nk_layout_row_push(ctx, text_w);
     nk_label_colored(ctx, text, NK_TEXT_LEFT, col);
     nk_layout_row_end(ctx);
 }
@@ -321,14 +329,26 @@ path_row(struct nk_context *ctx, const char *label, char *buf,
          const char *button, nk_plugin_filter filter)
 {
     int clicked;
-    /* Fill the available row while keeping each cell proportional, so the
-     * path/key field stays generous without imposing a fixed minimum width. */
-    nk_layout_row_begin(ctx, NK_DYNAMIC, 32, 3);
-    nk_layout_row_push(ctx, 0.14f);
+    struct nk_rect content = nk_window_get_content_region(ctx);
+    float label_w = 95.0f;
+    float button_w = 260.0f;
+    float edit_w;
+
+    /* Keep labels compact, reserve a sensible Browse/Auto-Detect width,
+     * and give the path/key field every remaining pixel. */
+    if (content.w < 700.0f) {
+        label_w = content.w * 0.17f;
+        button_w = content.w * 0.24f;
+    }
+    edit_w = content.w - label_w - button_w;
+    if (edit_w < 1.0f) edit_w = 1.0f;
+
+    nk_layout_row_begin(ctx, NK_STATIC, 32, 3);
+    nk_layout_row_push(ctx, label_w);
     nk_label(ctx, label, NK_TEXT_LEFT);
-    nk_layout_row_push(ctx, 0.72f);
+    nk_layout_row_push(ctx, edit_w);
     nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, buf, BUF_LEN, filter);
-    nk_layout_row_push(ctx, 0.14f);
+    nk_layout_row_push(ctx, button_w);
     clicked = nk_button_label(ctx, button);
     nk_layout_row_end(ctx);
     return clicked;
@@ -352,18 +372,24 @@ draw(struct nk_context *ctx, float win_w, float win_h)
     {
         float used = 0;
         int p;
+        struct nk_rect content = nk_window_get_content_region(ctx);
 
         /* header: icon + title + dark/light toggle */
-        nk_layout_row_begin(ctx, NK_DYNAMIC, 40, 3);
-        nk_layout_row_push(ctx, 0.06f);
+        {
+            float icon_w = content.w < 56.0f ? content.w * 0.25f : 28.0f;
+            float theme_w = content.w < 420.0f ? content.w * 0.18f : 110.0f;
+            float title_w = content.w - icon_w - theme_w;
+            if (title_w < 1.0f) title_w = 1.0f;
+            nk_layout_row_begin(ctx, NK_STATIC, 40, 3);
+            nk_layout_row_push(ctx, icon_w);
         p = push_font(ctx, f_icons);
         nk_label_colored(ctx, ico(ICON_UNLOCK), NK_TEXT_LEFT, accent);
         if (p) nk_style_pop_font(ctx);
-        nk_layout_row_push(ctx, 0.88f);
+            nk_layout_row_push(ctx, title_w);
         p = push_font(ctx, f_title);
         nk_label(ctx, "rmdecrypt", NK_TEXT_LEFT);
         if (p) nk_style_pop_font(ctx);
-        nk_layout_row_push(ctx, 0.06f);
+            nk_layout_row_push(ctx, theme_w);
         p = push_font(ctx, f_icons);
         if (nk_button_label(ctx, ico(g.dark ? ICON_SUN : ICON_MOON))) {
             g.dark = !g.dark;
@@ -371,6 +397,7 @@ draw(struct nk_context *ctx, float win_w, float win_h)
         }
         if (p) nk_style_pop_font(ctx);
         nk_layout_row_end(ctx);
+        }
 
         nk_layout_row_dynamic(ctx, 20, 1);
         p = push_font(ctx, f_italic);
