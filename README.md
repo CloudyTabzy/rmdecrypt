@@ -11,6 +11,8 @@ Decrypt (and re-encrypt) RPG Maker encrypted assets — images, audio, tilesets,
 - **PNG recovery** — restore encrypted PNG files even without the encryption key
 - **Auto key detection** — reads `encryptionKey` from `System.json` (walks the tree, finds it anywhere), searches `.js`/`.txt` files for `this._encryptionKey`, or derives the key from the first encrypted PNG
 - **Recursive** — processes entire directory trees preserving folder structure
+- **Compatibility controls** — verifies RPG Maker fake headers by default; accepts a custom 16-byte header when needed
+- **Safe outputs** — refuses to replace existing output files unless explicitly told to overwrite or clean the output directory
 - **Fast** — processes 27 MB of assets (~960 files) in ~0.3s
 
 ## Build
@@ -21,7 +23,20 @@ Requires Zig 0.16.0 or later.
 zig build install -Doptimize=ReleaseFast --prefix zig-out
 ```
 
-The binary is at `zig-out/bin/rmdecrypt.exe`.
+The CLI binary is at `zig-out/bin/rmdecrypt.exe`.
+
+### GUI
+
+A native Windows GUI (Nuklear + D3D11) is included:
+
+```bash
+zig build gui        # builds and launches zig-out/bin/rmdecrypt-gui.exe
+```
+
+It offers folder pickers and drag-and-drop, key auto-detection (including
+encryption), a decrypt/encrypt mode toggle (MV/MZ), editable fake-header,
+header-verification, overwrite, and guarded clean-output controls, a progress
+bar, and a live activity log over the same core as the CLI.
 
 ## Usage
 
@@ -31,13 +46,17 @@ rmdecrypt [options] <input_directory>
 Decrypt options:
   --key, -k <hex>     32-char hex encryption key
   --output, -o <dir>  Output directory (default: <input>_decrypted)
-  --ignore-header     Skip fake-header verification warning
+  --ignore-header     Process files even if the fake header is invalid
+  --header <hex>      Expected fake header (exactly 32 hex characters)
+  --overwrite         Replace output files that already exist
+  --clean-output      Delete the output directory before processing
+  --detect-key        Print the detected key and exit without writing files
   --help, -h          Show this help
 
 Encrypt options:
   --encrypt, -e       Re-encrypt plain assets back to RPG Maker format
   --mz                Use MZ extensions (.png_/.m4a_/.ogg_) instead of MV
-  --key, -k <hex>     Encryption key (required with --encrypt)
+  --key, -k <hex>     Encryption key (auto-detected when omitted)
   --output, -o <dir>  Output directory
 ```
 
@@ -55,6 +74,15 @@ rmdecrypt -e --key a1b2c3d4... "path/to/plain_assets" --output "path/to/output"
 
 # Re-encrypt assets for MZ
 rmdecrypt -e --mz --key a1b2c3d4... "path/to/plain_assets" --output "path/to/output"
+
+# Re-encrypt using the key detected from a game project's System.json
+rmdecrypt -e "path/to/game" --output "path/to/output"
+
+# Only print the key found in a game directory
+rmdecrypt --detect-key "path/to/game"
+
+# Work with a known non-standard fake header, replacing old output files
+rmdecrypt --header 5250474d560000000003010000000000 --overwrite "path/to/game"
 ```
 
 ## How It Works

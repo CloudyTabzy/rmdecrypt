@@ -1,882 +1,429 @@
+//! rmdecrypt GUI — Zig logic layer.
+//!
+//! Following the btworkshop_zig architecture: all Nuklear/Win32 UI code
+//! lives in C (`nk_shim.c` window plumbing + `gui_nk.c` widget tree); this
+//! file only exports the application logic the C side calls (`rmd_zig_*`)
+//! and the process entry points that forward into `rmd_gui_main()`.
+
 const std = @import("std");
-const builtin = @import("builtin");
-const dvui = @import("dvui");
-const SDL2Backend = @import("sdl2-backend");
 const decrypter = @import("decrypter.zig");
 const extensions = @import("extensions.zig");
 const key_detect = @import("key_detect.zig");
 const win32_folder_dialog = @import("win32_folder_dialog");
 const Dir = std.Io.Dir;
 
-// ─── SDL2 drop-event FFI ────────────────────────────────────────────────
-// We have to declare our own minimal SDL bindings because DVUI's SDL2
-// backend silently discards SDL_DROPFILE events (see backends/sdl.zig
-// line ~1710, "return false"). Intercepting them BEFORE the backend
-// processes events is the only way to drag-and-drop a folder onto us.
-//
-// The SDL_Event union is a 56-byte tagged union in SDL2; we only need
-// the .drop variant which is `SDL_DropEvent` (type + timestamp + file
-// + windowID). The `file` field is a heap-allocated UTF-8 string on
-// every supported platform since SDL 2.0.4, freed with SDL_free.
+const LOG_CAP = 1000;
 
-const SDL_DROPBEGIN: u32 = 0x1002; // 4098
-const SDL_DROPFILE: u32 = 0x1000; // 4096
-const SDL_DROPCOMPLETE: u32 = 0x1003; // 4099
-const SDL_EventType = u32;
+// ─── globals (single UI thread; set up lazily on first export call) ─────
 
-const SDL_DropEvent = extern struct {
-    type: SDL_EventType,
-    timestamp: u32,
-    padding: u32, // SDL puts a padding u32 here on 64-bit
-    file: ?[*]u8,
-    windowID: u32,
-};
+const gpa = std.heap.page_allocator;
 
-const SDL_Event = extern union {
-    type: SDL_EventType,
-    padding: [56]u8,
-    drop: SDL_DropEvent,
-};
+var g_threaded: ?*std.Io.Threaded = null;
+var g_io: std.Io = undefined;
 
-extern "SDL2" fn SDL_PollEvent(event: *SDL_Event) c_int;
-extern "SDL2" fn SDL_free(mem: ?*anyopaque) void;
+fn ensureInit() void {
+    if (g_threaded != null) return;
+    const t = gpa.create(std.Io.Threaded) catch @panic("out of memory");
+    t.* = std.Io.Threaded.init(gpa, .{});
+    g_threaded = t;
+    g_io = t.io();
+}
 
-const VERSION = "0.1.0";
-const BATCH_SIZE = 15;
-const TEXT_LIMIT = 1024;
+fn io() std.Io {
+    ensureInit();
+    return g_io;
+}
 
-const Status = enum { idle, scanning, processing, done };
+const LogEntry = struct { msg: [:0]const u8, err: bool };
 
-const LogEntry = struct { msg: []const u8, err: bool };
-
-const GuiState = struct {
-    input_list: std.ArrayList(u8) = .empty,
-    output_list: std.ArrayList(u8) = .empty,
-    key_list: std.ArrayList(u8) = .empty,
-    mode_decrypt: bool = true,
-    mz: bool = false,
-    status: Status = .idle,
+const Job = struct {
     files: std.ArrayList([]const u8) = .empty,
     idx: usize = 0,
-    done_count: usize = 0,
-    err_count: usize = 0,
+    done: usize = 0,
+    errors: usize = 0,
     total: usize = 0,
-    log: std.ArrayList(LogEntry) = .empty,
-    /// Set true while a file/folder is being dragged over the window
-    /// (from SDL_DROPBEGIN), cleared on SDL_DROPCOMPLETE. Used to
-    /// highlight the drop zones in the UI.
-    drop_hover: bool = false,
+    input: []u8 = &.{},
+    output: []u8 = &.{},
+    key: []u8 = &.{}, // raw key bytes (empty = no key)
+    decrypt: bool = true,
+    mz: bool = false,
+    ignore_header: bool = false,
+    overwrite: bool = false,
+    clean_output: bool = false,
+    header: [decrypter.DEFAULT_HEADER.len]u8 = decrypter.DEFAULT_HEADER,
+
+    fn reset(self: *Job) void {
+        for (self.files.items) |f| gpa.free(f);
+        self.files.clearRetainingCapacity();
+        self.idx = 0;
+        self.done = 0;
+        self.errors = 0;
+        self.total = 0;
+        gpa.free(self.input);
+        gpa.free(self.output);
+        gpa.free(self.key);
+        self.input = &.{};
+        self.output = &.{};
+        self.key = &.{};
+    }
 };
 
-fn appendLog(gpa: std.mem.Allocator, s: *GuiState, comptime fmt: []const u8, args: anytype, err: bool) void {
+var g_job: Job = .{};
+var g_log: std.ArrayList(LogEntry) = .empty;
+
+// ─── log ────────────────────────────────────────────────────────────────
+
+fn logFmt(comptime fmt: []const u8, args: anytype, err: bool) void {
     const msg = std.fmt.allocPrint(gpa, fmt, args) catch return;
-    s.log.append(gpa, LogEntry{ .msg = msg, .err = err }) catch {};
+    defer gpa.free(msg);
+    logSlice(msg, err);
 }
 
-/// Returns `text` unchanged if it fits within `max_width` at `font`'s natural
-/// size, otherwise returns a slice of `buf` containing the truncated text
-/// followed by "...". Falls back to `text` if formatting fails.
-fn ellipsizeToFit(text: []const u8, max_width: f32, font: dvui.Font, buf: []u8) []const u8 {
-    const full_size = font.textSize(text);
-    if (full_size.w <= max_width) return text;
-
-    const ellipsis = "...";
-    const ellipsis_w = font.textSize(ellipsis).w;
-    const avail = @max(20.0, max_width - ellipsis_w - 2.0);
-
-    var end_idx: usize = 0;
-    _ = font.textSizeEx(text, .{
-        .max_width = avail,
-        .end_idx = &end_idx,
-    });
-    if (end_idx == 0) return text;
-    return std.fmt.bufPrint(buf, "{s}...", .{text[0..end_idx]}) catch text;
+fn logSlice(msg: []const u8, err: bool) void {
+    if (g_log.items.len >= LOG_CAP) {
+        const old = g_log.orderedRemove(0);
+        gpa.free(old.msg);
+    }
+    const z = gpa.allocSentinel(u8, msg.len, 0) catch return;
+    @memcpy(z[0..msg.len], msg);
+    g_log.append(gpa, .{ .msg = z, .err = err }) catch {};
 }
 
-/// Modern Windows Explorer-style folder picker. On Windows uses the COM
-/// IFileOpenDialog (the same dialog File Explorer uses); elsewhere falls
-/// back to dvui.dialogNativeFolderSelect. Returns null on cancel.
-///
-/// NOTE: retained for reference / future use. The current UI only
-/// accepts input via drag-and-drop (see `pollDropEvents`); the Browse
-/// button was removed because the underlying dialog on this Windows
-/// install doesn't have the modern `IFileOpenDialog` implementation.
-fn showFolderPicker(gpa: std.mem.Allocator, title: []const u8) ?[]const u8 {
-    if (builtin.os.tag == .windows) {
-        if (win32_folder_dialog.selectFolder(gpa, title)) |maybe| {
-            if (maybe) |p| return p;
-            return null;
-        } else |_| {}
-    }
-    if (dvui.dialogNativeFolderSelect(gpa, .{ .title = title })) |maybe_p| {
-        if (maybe_p) |p| return p;
-    } else |_| {}
-    return null;
-}
+// ─── file processing ────────────────────────────────────────────────────
 
-/// Card-style section with subtle border, rounded corners, and a header.
-/// Use via: `var c = card(@src(), "Title"); defer c.deinit(); ...content...`
-const Card = struct {
-    box: *dvui.BoxWidget,
-
-    pub fn init(src: std.builtin.SourceLocation, title: []const u8) Card {
-        // Outer box: rounded, subtle border, subtle fill (window style), small margin.
-        const card_opts: dvui.Options = .{
-            .style = .window,
-            .background = true,
-            .border = dvui.Rect.all(1),
-            .corners = dvui.CornerRect.all(8),
-            .padding = dvui.Rect.all(14),
-            .margin = .{ .y = 6 },
-            .expand = .horizontal,
-        };
-        const box = dvui.box(src, .{ .dir = .vertical }, card_opts);
-        if (title.len > 0) {
-            dvui.labelNoFmt(src, title, .{}, .{
-                .font = dvui.Font.theme(.heading),
-                .margin = .{ .x = 0, .y = 0, .w = 0, .h = 8 },
-            });
-        }
-        return .{ .box = box };
-    }
-
-    pub fn deinit(self: *Card) void {
-        self.box.deinit();
-    }
-};
-
-/// Set `text_buf` to `path`, mirroring the input into the output when
-/// `auto_fill_output` is set and the output is currently empty.
-fn applyDroppedPath(
-    gpa: std.mem.Allocator,
-    text_buf: *std.ArrayList(u8),
-    path: []const u8,
-    auto_fill_output: bool,
-    state: *GuiState,
-    is_output: bool,
-) void {
-    text_buf.clearRetainingCapacity();
-    text_buf.appendSlice(gpa, path) catch {};
-    if (auto_fill_output and !is_output and state.output_list.items.len == 0) {
-        state.output_list.clearRetainingCapacity();
-        state.output_list.appendSlice(gpa, path) catch {};
-        state.output_list.appendSlice(gpa, "_decrypted") catch {};
-    }
-}
-
-/// Drop-zone row. The whole row is a visual target that lights up while a
-/// file is dragged over the window. Users populate the field by dragging
-/// a folder from Explorer onto the row (no Browse button anymore).
-fn pathRow(
-    src: std.builtin.SourceLocation,
-    base_id: usize,
-    icon_tvg: []const u8,
-    label_str: []const u8,
-    text_buf: *std.ArrayList(u8),
-    gpa: std.mem.Allocator,
-    state: *GuiState,
-    is_output: bool,
-) void {
-    const row_id = base_id * 10;
-    const is_empty = text_buf.items.len == 0;
-
-    // The whole row sits in a thin rounded box. The border + fill switch
-    // when a drag enters the window (state.drop_hover) so the user gets
-    // unmistakable feedback that the row is a drop target.
-    const accent = dvui.Color{ .r = 0x35, .g = 0x84, .b = 0xe4 };
-    const border_color: dvui.Color = if (state.drop_hover) accent else .{ .r = 0x50, .g = 0x50, .b = 0x50 };
-    const fill_color: dvui.Color = if (state.drop_hover)
-        .{ .r = 0x1f, .g = 0x2a, .b = 0x3a }
-    else
-        .{ .r = 0x26, .g = 0x26, .b = 0x26 };
-
-    var row = dvui.box(src, .{ .dir = .horizontal }, .{
-        .expand = .horizontal,
-        .margin = .{ .y = 4 },
-        .padding = .{ .x = 10, .y = 8 },
-        .background = true,
-        .color_fill = fill_color,
-        .border = dvui.Rect.all(1),
-        .color_border = border_color,
-        .corners = dvui.CornerRect.all(6),
-        .id_extra = row_id,
-    });
-    defer row.deinit();
-
-    // Use the row's actual contentRect (now allocated by parent layout) to
-    // measure how much horizontal space the textEntry will actually receive.
-    // No Browse button anymore, so we only need to reserve space for
-    // icon + label + a small inline hint.
-    const row_w = row.data().contentRect().w;
-    const body_font = dvui.Font.theme(.body);
-    const heading_font = dvui.Font.theme(.heading);
-    const icon_w: f32 = 18.0 + 8.0;
-    const label_w: f32 = @max(110.0, heading_font.textSize(label_str).w);
-    const hint_w: f32 = if (is_empty and !state.drop_hover) 200.0 else 0.0;
-    const textentry_internal_pad: f32 = 12.0; // 6 left + 6 right
-    const avail_w = @max(20.0, row_w - icon_w - label_w - hint_w - textentry_internal_pad);
-
-    // Icon
-    dvui.icon(src, label_str, icon_tvg, .{}, .{
-        .min_size_content = .{ .h = 18, .w = 18 },
-        .gravity_y = 0.5,
-        .margin = .{ .w = 8 },
-        .id_extra = row_id + 1,
-    });
-    // Label
-    dvui.labelNoFmt(src, label_str, .{}, .{
-        .min_size_content = .{ .w = 110 },
-        .gravity_y = 0.5,
-        .font = dvui.Font.theme(.heading),
-        .id_extra = row_id + 2,
-    });
-    // Text entry
-    {
-        var placeholder_buf: [64]u8 = undefined;
-        const full_placeholder = if (is_output) "output directory" else "path/to/game";
-        const placeholder = ellipsizeToFit(full_placeholder, avail_w, body_font, &placeholder_buf);
-        const te = dvui.textEntry(src, .{
-            .text = .{ .array_list = .{ .backing = text_buf, .allocator = gpa, .limit = TEXT_LIMIT } },
-            .placeholder = placeholder,
-        }, .{ .expand = .horizontal, .id_extra = row_id + 3 });
-        te.deinit();
-    }
-
-    // Right-aligned hint, visible only when the field is empty and
-    // nothing is being dragged. Tiny subtle prompt to tell the user
-    // what to do.
-    if (is_empty and !state.drop_hover) {
-        _ = dvui.spacer(src, .{ .expand = .horizontal, .min_size_content = .width(8), .id_extra = row_id + 4 });
-        dvui.labelNoFmt(src, "⌬  drag a folder here", .{}, .{
-            .gravity_y = 0.5,
-            .color_text = .{ .r = 0x80, .g = 0x80, .b = 0x80 },
-            .font = dvui.Font.theme(.body),
-            .margin = .{ .w = 8 },
-            .id_extra = row_id + 5,
-        });
-    } else if (state.drop_hover) {
-        _ = dvui.spacer(src, .{ .expand = .horizontal, .min_size_content = .width(8), .id_extra = row_id + 4 });
-        dvui.labelNoFmt(src, "⌃  release to select", .{}, .{
-            .gravity_y = 0.5,
-            .color_text = accent,
-            .font = dvui.Font.theme(.heading),
-            .margin = .{ .w = 8 },
-            .id_extra = row_id + 5,
-        });
-    }
-}
-
-/// Poll SDL2's event queue for drag-and-drop events. DVUI's SDL2 backend
-/// discards these so we have to peek before `backend.addAllEvents(&win)`
-/// steals the events. Extracted path is written into `dropped_path` (a
-/// heap-allocated UTF-8 string the caller must free) and `drop_hover`
-/// is updated for visual feedback.
-fn pollDropEvents(
-    state: *GuiState,
-    gpa: std.mem.Allocator,
-    dropped_path: *?[]u8,
-) void {
-    dropped_path.* = null;
-    var event: SDL_Event = undefined;
-    while (SDL_PollEvent(&event) != 0) {
-        switch (event.type) {
-            SDL_DROPBEGIN => {
-                state.drop_hover = true;
-            },
-            SDL_DROPFILE => {
-                if (event.drop.file) |cstr| {
-                    const slice = std.mem.sliceTo(cstr, 0);
-                    dropped_path.* = gpa.dupeZ(u8, slice) catch null;
-                    SDL_free(@ptrCast(cstr));
-                }
-            },
-            SDL_DROPCOMPLETE => {
-                state.drop_hover = false;
-            },
-            else => {
-                // Re-inject non-drop events back into SDL's queue by
-                // pushing them with SDL_PushEvent. We can't call
-                // PushEvent from Zig directly (different ABI), so we
-                // fall through and let the backend pick them up next
-                // frame — events we consume here are LOST, which is
-                // fine because the backend also polls independently.
-                // The duplication is harmless for the user (each event
-                // is processed at most twice across two frames).
-                state.drop_hover = false;
-            },
-        }
-    }
-}
-
-/// Validate that `path` points at an existing directory. Returns the
-/// canonical absolute path on success, null on failure.
-fn validateDirectory(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !?[]u8 {
-    if (path.len == 0) return null;
-    var dir = Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return null;
-    defer dir.close(io);
-    return try gpa.dupe(u8, path);
-}
-
-fn processFile(gpa: std.mem.Allocator, io: std.Io, input_dir: Dir, output_dir: Dir, s: *GuiState, path: []const u8) void {
+fn processFile(input_dir: Dir, output_dir: Dir, path: []const u8) void {
     const ext_dot = Dir.path.extension(path);
     if (ext_dot.len == 0) return;
     const ext = ext_dot[1..];
-    const enc = extensions.EncryptedExt.fromString(ext) orelse return;
+    // Per-mode extension gate (encrypt mode must NOT hit the EncryptedExt
+    // check — plain .png/.m4a/.ogg inputs would be silently skipped).
+    if (g_job.decrypt) {
+        if (extensions.EncryptedExt.fromString(ext) == null) return;
+    } else {
+        if (extensions.NormalExt.fromString(ext) == null) return;
+    }
 
-    var in_file = input_dir.openFile(io, path, .{ .mode = .read_only }) catch {
-        appendLog(gpa, s, "  ✗ {s}: open error", .{path}, true);
+    var in_file = input_dir.openFile(io(), path, .{ .mode = .read_only }) catch {
+        logFmt("  x {s}: open error", .{path}, true);
+        g_job.errors += 1;
         return;
     };
-    defer in_file.close(io);
-    const stat = in_file.stat(io) catch {
-        appendLog(gpa, s, "  ✗ {s}: stat error", .{path}, true);
+    defer in_file.close(io());
+    const stat = in_file.stat(io()) catch {
+        logFmt("  x {s}: stat error", .{path}, true);
+        g_job.errors += 1;
         return;
     };
     const data = gpa.alloc(u8, stat.size) catch return;
     defer gpa.free(data);
-    var rdr = in_file.reader(io, &.{});
+    var rdr = in_file.reader(io(), &.{});
     rdr.interface.readSliceAll(data) catch {
-        appendLog(gpa, s, "  ✗ {s}: read error", .{path}, true);
+        logFmt("  x {s}: read error", .{path}, true);
+        g_job.errors += 1;
         return;
     };
 
     const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return;
     var pbuf: [2048]u8 = undefined;
+    const key = g_job.key;
 
-    if (s.mode_decrypt) {
-        const out_path = std.fmt.bufPrint(&pbuf, "{s}.{s}", .{ path[0..dot], enc.normalExt() }) catch return;
-        const parent = Dir.path.dirname(out_path);
-        if (parent) |d| {
-            if (d.len > 0) output_dir.createDirPath(io, d) catch {};
+    if (g_job.decrypt) {
+        if (data.len < decrypter.DEFAULT_HEADER.len) {
+            logFmt("  x {s}: file is smaller than the RPG Maker header", .{path}, true);
+            g_job.errors += 1;
+            return;
         }
-        const payload = data[decrypter.DEFAULT_HEADER.len..];
-        for (0..@min(payload.len, s.key_list.items.len)) |i|
-            payload[i] ^= s.key_list.items[i];
-        output_dir.writeFile(io, .{ .sub_path = out_path, .data = payload }) catch {
-            appendLog(gpa, s, "  ✗ {s}: write error", .{path}, true);
+        if (!g_job.ignore_header and !decrypter.verifyHeaderAgainst(data, g_job.header[0..])) {
+            logFmt("  x {s}: invalid RPG Maker header (enable Ignore header to force)", .{path}, true);
+            g_job.errors += 1;
+            return;
+        }
+        const enc = extensions.EncryptedExt.fromString(ext).?;
+        const out_path = std.fmt.bufPrint(&pbuf, "{s}.{s}", .{ path[0..dot], enc.normalExt() }) catch return;
+        if (Dir.path.dirname(out_path)) |d| {
+            if (d.len > 0) output_dir.createDirPath(io(), d) catch {};
+        }
+        var restored: ?[]u8 = null;
+        defer if (restored) |bytes| gpa.free(bytes);
+        const output_data: []const u8 = if (key.len > 0) blk: {
+            const payload = data[decrypter.DEFAULT_HEADER.len..];
+            for (0..@min(payload.len, key.len)) |i| payload[i] ^= key[i];
+            break :blk payload;
+        } else if (enc.isPng()) blk: {
+            restored = decrypter.DefaultDecrypter.restorePng(data, gpa) catch {
+                logFmt("  x {s}: cannot restore PNG", .{path}, true);
+                g_job.errors += 1;
+                return;
+            };
+            break :blk restored.?;
+        } else {
+            logFmt("  x {s}: no key; audio skipped", .{path}, true);
+            g_job.errors += 1;
             return;
         };
-        appendLog(gpa, s, "  ✓ {s}", .{out_path}, false);
+        output_dir.writeFile(io(), .{ .sub_path = out_path, .data = output_data, .flags = .{ .exclusive = !g_job.overwrite } }) catch {
+            logFmt("  x {s}: write error", .{path}, true);
+            g_job.errors += 1;
+            return;
+        };
+        logFmt("  + {s}", .{out_path}, false);
     } else {
         const norm = extensions.NormalExt.fromString(ext) orelse return;
-        const enc_ext_str = norm.encryptedExt(s.mz);
-        const out_path = std.fmt.bufPrint(&pbuf, "{s}.{s}", .{ path[0..dot], enc_ext_str }) catch return;
-        const parent = Dir.path.dirname(out_path);
-        if (parent) |d| {
-            if (d.len > 0) output_dir.createDirPath(io, d) catch {};
+        const out_path = std.fmt.bufPrint(&pbuf, "{s}.{s}", .{ path[0..dot], norm.encryptedExt(g_job.mz) }) catch return;
+        if (Dir.path.dirname(out_path)) |d| {
+            if (d.len > 0) output_dir.createDirPath(io(), d) catch {};
         }
-        for (0..@min(data.len, s.key_list.items.len)) |i|
-            data[i] ^= s.key_list.items[i];
-        const out_data = std.mem.concat(gpa, u8, &.{ decrypter.DEFAULT_HEADER[0..], data }) catch return;
+        for (0..@min(data.len, key.len)) |i|
+            data[i] ^= key[i];
+        const out_data = std.mem.concat(gpa, u8, &.{ g_job.header[0..], data }) catch return;
         defer gpa.free(out_data);
-        output_dir.writeFile(io, .{ .sub_path = out_path, .data = out_data }) catch {
-            appendLog(gpa, s, "  ✗ {s}: write error", .{path}, true);
+        output_dir.writeFile(io(), .{ .sub_path = out_path, .data = out_data, .flags = .{ .exclusive = !g_job.overwrite } }) catch {
+            logFmt("  x {s}: write error", .{path}, true);
+            g_job.errors += 1;
             return;
         };
-        appendLog(gpa, s, "  ✓ {s}", .{out_path}, false);
+        logFmt("  + {s}", .{out_path}, false);
     }
 }
 
-pub fn main(init: std.process.Init) !void {
-    if (builtin.os.tag == .windows)
-        dvui.Backend.Common.windowsAttachConsole() catch {};
-    SDL2Backend.enableSDLLogging();
+// ─── exports called from gui_nk.c ───────────────────────────────────────
 
-    const gpa = init.gpa;
-    const arena = init.arena;
-    const arena_alloc = arena.allocator();
+export fn rmd_zig_is_dir(path: [*:0]const u8) c_int {
+    const p = std.mem.sliceTo(path, 0);
+    if (p.len == 0) return 0;
+    var dir = Dir.cwd().openDir(io(), p, .{ .iterate = true }) catch return 0;
+    dir.close(io());
+    return 1;
+}
 
-    var backend = try SDL2Backend.initWindow(.{
-        .io = init.io,
-        .environ_map = init.environ_map,
-        .size = .{ .w = 1100, .h = 620 },
-        .min_size = .{ .w = 880, .h = 520 },
-        .vsync = true,
-        .title = "rmdecrypt v" ++ VERSION ++ " — RPG Maker MV/MZ Asset Tool",
-    });
-    defer backend.deinit();
+export fn rmd_zig_pick_folder(title: [*:0]const u8, out: [*]u8, max: c_int) c_int {
+    const t = std.mem.sliceTo(title, 0);
+    const p = (win32_folder_dialog.selectFolder(gpa, t) catch null) orelse return 0;
+    defer gpa.free(p);
+    const n: usize = @intCast(@max(0, max - 1));
+    const copy = @min(p.len, n);
+    @memcpy(out[0..copy], p[0..copy]);
+    out[copy] = 0;
+    return @intCast(copy);
+}
 
-    var window_open = true;
-    var win = try dvui.Window.init(@src(), gpa, backend.backend(), .{
-        .theme = dvui.Theme.builtin.adwaita_dark,
-        .open_flag = &window_open,
-    });
-    defer win.deinit();
+/// Writes the detected key as a hex string into `out`. Returns its length,
+/// or 0 when no key could be found.
+export fn rmd_zig_detect_key(input: [*:0]const u8, out: [*]u8, max: c_int) c_int {
+    const ip = std.mem.sliceTo(input, 0);
+    if (ip.len == 0) return 0;
+    var id = Dir.cwd().openDir(io(), ip, .{ .iterate = true, .access_sub_paths = true }) catch {
+        logFmt("  x cannot open input folder: {s}", .{ip}, true);
+        return 0;
+    };
+    defer id.close(io());
 
-    var s: GuiState = .{};
-    defer {
-        s.input_list.deinit(gpa);
-        s.output_list.deinit(gpa);
-        s.key_list.deinit(gpa);
-        s.files.deinit(gpa);
-        s.log.deinit(gpa);
+    const k = (key_detect.detectFromInput(io(), gpa, id) catch null) orelse return 0;
+    defer gpa.free(k);
+
+    // detectFromInput yields a hex string (System.json / JS files) or raw
+    // key bytes (PNG-derived). Normalize to hex for the UI field.
+    var hex_buf: [64]u8 = undefined;
+    const hex: []const u8 = if (key_detect.validateKeyHex(k))
+        k
+    else blk: {
+        if (k.len * 2 > hex_buf.len) return 0;
+        const charset = "0123456789abcdef";
+        for (k, 0..) |b, i| {
+            hex_buf[i * 2] = charset[b >> 4];
+            hex_buf[i * 2 + 1] = charset[b & 15];
+        }
+        break :blk hex_buf[0 .. k.len * 2];
+    };
+
+    const n: usize = @intCast(@max(0, max - 1));
+    const copy = @min(hex.len, n);
+    @memcpy(out[0..copy], hex[0..copy]);
+    out[copy] = 0;
+    logFmt("  + key detected: {s}", .{hex[0..copy]}, false);
+    return @intCast(copy);
+}
+
+/// Scans `input` for processable files and stores the job. Returns the
+/// number of files found, or <= 0 on failure.
+export fn rmd_zig_scan(
+    input: [*:0]const u8,
+    output: [*:0]const u8,
+    key_hex: [*:0]const u8,
+    header_hex: [*:0]const u8,
+    decrypt: c_int,
+    mz: c_int,
+    ignore_header: c_int,
+    overwrite: c_int,
+    clean_output: c_int,
+) c_int {
+    const ip = std.mem.sliceTo(input, 0);
+    const op = std.mem.sliceTo(output, 0);
+    const kh = std.mem.sliceTo(key_hex, 0);
+    const hh = std.mem.sliceTo(header_hex, 0);
+
+    g_job.reset();
+    g_log.clearRetainingCapacity();
+
+    // Convert the UI's hex key to raw bytes (empty = no key).
+    if (kh.len > 0) {
+        if (!key_detect.validateKeyHex(kh)) {
+            logFmt("  x invalid key: need an even number of hex chars (got {d})", .{kh.len}, true);
+            return -1;
+        }
+        g_job.key = key_detect.hexKeyToBytes(kh, gpa) catch {
+            logFmt("  x invalid key characters", .{}, true);
+            return -1;
+        };
     }
 
-    var interrupted = false;
-    while (window_open) {
-        const nstime = win.beginWait(interrupted);
-        try win.begin(nstime);
+    var id = Dir.cwd().openDir(io(), ip, .{ .iterate = true, .access_sub_paths = true }) catch {
+        logFmt("  x cannot open input folder: {s}", .{ip}, true);
+        return -1;
+    };
+    defer id.close(io());
 
-        // Poll SDL2 directly for drag-and-drop events before DVUI's
-        // backend discards them (see backends/sdl.zig). Non-drop events
-        // get re-pumped naturally on the next frame by the backend.
-        var dropped_path: ?[]u8 = null;
-        pollDropEvents(&s, gpa, &dropped_path);
-        defer if (dropped_path) |p| gpa.free(p);
-
-        if (dropped_path) |path| {
-            if (try validateDirectory(gpa, init.io, path)) |valid_path| {
-                defer gpa.free(valid_path);
-                if (s.input_list.items.len == 0) {
-                    applyDroppedPath(gpa, &s.input_list, valid_path, true, &s, false);
-                } else {
-                    applyDroppedPath(gpa, &s.output_list, valid_path, false, &s, true);
-                }
-                appendLog(gpa, &s, "  ✓ dropped: {s}", .{valid_path}, false);
-            } else {
-                appendLog(gpa, &s, "  ✗ dropped: not a directory: {s}", .{path}, true);
-            }
-        }
-
-        try backend.addAllEvents(&win);
-
-        // ── Root vertical layout ──────────────────────────────────────────────
-        {
-            var vbox = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both, .margin = .{ .x = 14, .y = 14 } });
-            defer vbox.deinit();
-
-            // ── Header (icon + title + subtitle) ─────────────────────────────
-            {
-                var hrow = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .h = 8 } });
-                defer hrow.deinit();
-
-                dvui.icon(@src(), "app_logo", dvui.entypo.lock, .{}, .{
-                    .min_size_content = .{ .h = 32, .w = 32 },
-                    .gravity_y = 0.5,
-                    .margin = .{ .w = 10 },
-                    .color_text = dvui.Color{ .r = 0x35, .g = 0x84, .b = 0xe4 },
-                });
-                {
-                    var vcol = dvui.box(@src(), .{ .dir = .vertical }, .{ .gravity_y = 0.5 });
-                    defer vcol.deinit();
-                    dvui.label(@src(), "rmdecrypt v{s}", .{VERSION}, .{
-                        .font = dvui.Font.theme(.title),
-                    });
-                    dvui.labelNoFmt(@src(), "Decrypt or re-encrypt RPG Maker MV/MZ assets", .{}, .{ .font = dvui.Font.theme(.body) });
-                }
-            }
-
-            // ── Folders card ─────────────────────────────────────────────────
-            {
-                var c = Card.init(@src(), "Folders");
-                defer c.deinit();
-                pathRow(@src(), 1, dvui.entypo.folder, "Input Folder", &s.input_list, gpa, &s, false);
-                pathRow(@src(), 2, dvui.entypo.archive, "Output Folder", &s.output_list, gpa, &s, true);
-            }
-
-            // ── Encryption key card ─────────────────────────────────────────
-            {
-                var c = Card.init(@src(), "Encryption Key");
-                defer c.deinit();
-
-                var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .y = 4 }, .id_extra = 10 });
-                defer row.deinit();
-
-                // Measure row width and subtract known siblings + textEntry
-                // internal padding so the placeholder fits with ellipsis.
-                const row_w = row.data().contentRect().w;
-                const body_font = dvui.Font.theme(.body);
-                const icon_w: f32 = 18.0 + 8.0 * 2.0;
-                const label_w: f32 = @max(110.0, dvui.Font.theme(.heading).textSize("Key").w);
-                const spacer_w: f32 = 6.0;
-                const button_w: f32 = 120.0 + 8.0 * 2.0 + 6.0 * 2.0; // Auto-Detect
-                const textentry_internal_pad: f32 = 12.0;
-                const avail_w = @max(20.0, row_w - icon_w - label_w - spacer_w - button_w - textentry_internal_pad);
-
-                dvui.icon(@src(), "key_icon", dvui.entypo.key, .{}, .{
-                    .min_size_content = .{ .h = 18, .w = 18 },
-                    .gravity_y = 0.5,
-                    .margin = .{ .w = 8 },
-                    .id_extra = 10,
-                });
-                dvui.labelNoFmt(@src(), "Key", .{}, .{
-                    .min_size_content = .{ .w = 110 },
-                    .gravity_y = 0.5,
-                    .font = dvui.Font.theme(.heading),
-                    .id_extra = 10,
-                });
-                {
-                    var placeholder_buf: [64]u8 = undefined;
-                    const placeholder = ellipsizeToFit("auto-detect or 32-char hex key", avail_w, body_font, &placeholder_buf);
-                    const te = dvui.textEntry(@src(), .{
-                        .text = .{ .array_list = .{ .backing = &s.key_list, .allocator = gpa, .limit = TEXT_LIMIT } },
-                        .placeholder = placeholder,
-                    }, .{ .expand = .horizontal, .id_extra = 10 });
-                    te.deinit();
-                }
-                _ = dvui.spacer(@src(), .{ .min_size_content = .width(6), .id_extra = 10 });
-                if (dvui.button(@src(), "Auto-Detect", .{}, .{
-                    .min_size_content = .{ .w = 120, .h = 28 },
-                    .style = .control,
-                    .id_extra = 10,
-                })) {
-                    const ip = s.input_list.items;
-                    if (ip.len > 0) {
-                        if (Dir.cwd().openDir(init.io, ip, .{ .iterate = true, .access_sub_paths = true })) |id| {
-                            defer id.close(init.io);
-                            const detected = key_detect.detectFromInput(init.io, arena_alloc, id) catch null;
-                            if (detected) |k| {
-                                defer arena_alloc.free(k);
-                                s.key_list.clearRetainingCapacity();
-                                s.key_list.appendSlice(gpa, k) catch {};
-                                appendLog(gpa, &s, "  ✓ Key detected: {s}", .{k}, false);
-                            } else {
-                                dvui.dialog(@src(), .{}, .{
-                                    .title = "Key Not Found",
-                                    .message = "Could not find an encryption key in that folder. PNG files will still be restored without a key, but audio files cannot be processed.",
-                                    .modal = true,
-                                    .ok_label = "OK",
-                                });
-                            }
-                        } else |_| {}
-                    }
-                }
-
-                // ── Key status line ────────────────────────────────────────
-                {
-                    var srow = dvui.box(@src(), .{ .dir = .horizontal }, .{
-                        .expand = .horizontal,
-                        .margin = .{ .y = 4 },
-                    });
-                    defer srow.deinit();
-                    _ = dvui.spacer(@src(), .{ .min_size_content = .width(26) });
-
-                    if (s.key_list.items.len == 16) {
-                        dvui.icon(@src(), "ok", dvui.entypo.check, .{}, .{
-                            .min_size_content = .{ .h = 14, .w = 14 },
-                            .gravity_y = 0.5,
-                            .margin = .{ .w = 4 },
-                            .color_text = dvui.Color{ .r = 0x33, .g = 0xd1, .b = 0x7a },
-                        });
-                        dvui.labelNoFmt(@src(), "Key ready (16 bytes)", .{}, .{
-                            .color_text = dvui.Color{ .r = 0x33, .g = 0xd1, .b = 0x7a },
-                            .gravity_y = 0.5,
-                            .margin = .{ .x = 4 },
-                        });
-                    } else if (s.key_list.items.len > 0) {
-                        dvui.icon(@src(), "warn", dvui.entypo.warning, .{}, .{
-                            .min_size_content = .{ .h = 14, .w = 14 },
-                            .gravity_y = 0.5,
-                            .margin = .{ .w = 4 },
-                            .color_text = dvui.Color{ .r = 0xff, .g = 0xc1, .b = 0x07 },
-                        });
-                        dvui.label(@src(), "Invalid key length ({d} bytes — need 16)", .{s.key_list.items.len}, .{
-                            .color_text = dvui.Color{ .r = 0xff, .g = 0xc1, .b = 0x07 },
-                            .gravity_y = 0.5,
-                            .margin = .{ .x = 4 },
-                        });
-                    } else {
-                        dvui.icon(@src(), "info", dvui.entypo.info, .{}, .{
-                            .min_size_content = .{ .h = 14, .w = 14 },
-                            .gravity_y = 0.5,
-                            .margin = .{ .w = 4 },
-                            .color_text = dvui.Color{ .r = 0x90, .g = 0x90, .b = 0x90 },
-                        });
-                        dvui.labelNoFmt(@src(), "No key set — PNG files will be restored without decryption", .{}, .{
-                            .color_text = dvui.Color{ .r = 0x90, .g = 0x90, .b = 0x90 },
-                            .gravity_y = 0.5,
-                            .margin = .{ .x = 4 },
-                        });
-                    }
-                }
-            }
-
-            // ── Options card ─────────────────────────────────────────────────
-            {
-                var c = Card.init(@src(), "Options");
-                defer c.deinit();
-
-                var row1 = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .y = 2 }, .id_extra = 20 });
-                defer row1.deinit();
-                dvui.icon(@src(), "mode", dvui.entypo.cog, .{}, .{
-                    .min_size_content = .{ .h = 18, .w = 18 },
-                    .gravity_y = 0.5,
-                    .margin = .{ .w = 8 },
-                    .id_extra = 20,
-                });
-                dvui.labelNoFmt(@src(), "Mode", .{}, .{
-                    .min_size_content = .{ .w = 110 },
-                    .gravity_y = 0.5,
-                    .font = dvui.Font.theme(.heading),
-                    .id_extra = 20,
-                });
-
-                // Decrypt chip
-                if (dvui.button(
-                    @src(),
-                    if (s.mode_decrypt) "  ✓ Decrypt  " else "    Decrypt  ",
-                    .{},
-                    .{
-                        .style = if (s.mode_decrypt) .highlight else .control,
-                        .min_size_content = .{ .h = 28 },
-                        .margin = .{ .w = 4 },
-                        .id_extra = 21,
-                    },
-                )) s.mode_decrypt = true;
-                // Encrypt chip
-                if (dvui.button(
-                    @src(),
-                    if (!s.mode_decrypt) "  ✓ Encrypt  " else "    Encrypt  ",
-                    .{},
-                    .{
-                        .style = if (!s.mode_decrypt) .highlight else .control,
-                        .min_size_content = .{ .h = 28 },
-                        .margin = .{ .w = 4 },
-                        .id_extra = 22,
-                    },
-                )) s.mode_decrypt = false;
-
-                _ = dvui.spacer(@src(), .{ .min_size_content = .width(20), .id_extra = 20 });
-                dvui.labelNoFmt(@src(), "Format:", .{}, .{
-                    .gravity_y = 0.5,
-                    .margin = .{ .w = 8 },
-                    .id_extra = 20,
-                });
-                if (dvui.button(@src(), if (!s.mz) "  ✓ MV  " else "    MV  ", .{}, .{
-                    .style = if (!s.mz) .highlight else .control,
-                    .min_size_content = .{ .h = 28 },
-                    .margin = .{ .w = 4 },
-                    .id_extra = 23,
-                })) s.mz = false;
-                if (dvui.button(@src(), if (s.mz) "  ✓ MZ  " else "    MZ  ", .{}, .{
-                    .style = if (s.mz) .highlight else .control,
-                    .min_size_content = .{ .h = 28 },
-                    .margin = .{ .w = 4 },
-                    .id_extra = 24,
-                })) s.mz = true;
-
-                // Hint
-                {
-                    var hrow = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .y = 6 }, .id_extra = 25 });
-                    defer hrow.deinit();
-                    _ = dvui.spacer(@src(), .{ .min_size_content = .width(26), .id_extra = 25 });
-                    const hint = if (s.mode_decrypt)
-                        (if (s.mz) "Will decrypt .png_ .m4a_ .ogg_ → .png .m4a .ogg" else "Will decrypt .rpgmvp .rpgmvm .rpgmvo → .png .m4a .ogg")
-                    else
-                        (if (s.mz) "Will encrypt .png .m4a .ogg → .png_ .m4a_ .ogg_" else "Will encrypt .png .m4a .ogg → .rpgmvp .rpgmvm .rpgmvo");
-                    dvui.icon(@src(), "info2", dvui.entypo.info, .{}, .{
-                        .min_size_content = .{ .h = 12, .w = 12 },
-                        .gravity_y = 0.5,
-                        .margin = .{ .w = 4 },
-                        .color_text = dvui.Color{ .r = 0x90, .g = 0x90, .b = 0x90 },
-                        .id_extra = 25,
-                    });
-                    dvui.labelNoFmt(@src(), hint, .{}, .{
-                        .color_text = dvui.Color{ .r = 0x90, .g = 0x90, .b = 0x90 },
-                        .gravity_y = 0.5,
-                        .margin = .{ .x = 4 },
-                        .id_extra = 25,
-                    });
-                }
-            }
-
-            // ── Action button ────────────────────────────────────────────────
-            {
-                const can_start = s.input_list.items.len > 0 and s.status != .processing and s.status != .scanning;
-                const label = switch (s.status) {
-                    .idle, .done => if (s.mode_decrypt) "  ⬇  Start Decryption  " else "  ⬆  Start Encryption  ",
-                    .scanning => "  ⏳ Scanning…  ",
-                    .processing => "  ⚙  Processing…  ",
-                };
-                if (dvui.button(@src(), label, .{ .grayed = !can_start }, .{
-                    .style = if (can_start) .highlight else .control,
-                    .expand = .horizontal,
-                    .min_size_content = .{ .h = 42 },
-                    .font = dvui.Font.theme(.heading),
-                    .margin = .{ .y = 8 },
-                    .corners = dvui.CornerRect.all(8),
-                })) {
-                    if (can_start) {
-                        const ip = s.input_list.items;
-                        if (Dir.cwd().openDir(init.io, ip, .{ .iterate = true, .access_sub_paths = true })) |id| {
-                            defer id.close(init.io);
-                            s.status = .scanning;
-                            s.files.clearRetainingCapacity();
-                            s.log.clearRetainingCapacity();
-                            s.idx = 0;
-                            s.done_count = 0;
-                            s.err_count = 0;
-                            s.total = 0;
-                            var walker = id.walk(gpa) catch {
-                                s.status = .idle;
-                                return;
-                            };
-                            defer walker.deinit();
-                            while (true) {
-                                const entry = walker.next(init.io) catch break orelse break;
-                                if (entry.kind != .file) continue;
-                                const ed = Dir.path.extension(entry.basename);
-                                if (ed.len == 0) continue;
-                                if (s.mode_decrypt) {
-                                    if (extensions.EncryptedExt.fromString(ed[1..]) != null)
-                                        s.files.append(gpa, gpa.dupe(u8, entry.path) catch continue) catch {};
-                                } else {
-                                    if (extensions.NormalExt.fromString(ed[1..]) != null)
-                                        s.files.append(gpa, gpa.dupe(u8, entry.path) catch continue) catch {};
-                                }
-                            }
-                            s.total = s.files.items.len;
-                            if (s.total == 0) {
-                                dvui.dialog(@src(), .{}, .{
-                                    .title = "No Files",
-                                    .message = "No matching files found in that folder.",
-                                    .modal = true,
-                                    .ok_label = "OK",
-                                });
-                                s.status = .idle;
-                            } else {
-                                if (s.output_list.items.len > 0)
-                                    Dir.cwd().createDirPath(init.io, s.output_list.items) catch {};
-                                appendLog(gpa, &s, "  → Found {d} files", .{s.total}, false);
-                                s.status = .processing;
-                            }
-                        } else |_| {}
-                    }
-                }
-            }
-
-            // ── Progress card ────────────────────────────────────────────────
-            if (s.status == .processing or s.status == .done) {
-                var c = Card.init(@src(), "Progress");
-                defer c.deinit();
-
-                const pct = if (s.total > 0) @as(f32, @floatFromInt(s.done_count)) / @as(f32, @floatFromInt(s.total)) else 0.0;
-                dvui.progress(@src(), .{ .percent = pct }, .{
-                    .expand = .horizontal,
-                    .min_size_content = .{ .h = 18 },
-                    .corners = dvui.CornerRect.all(4),
-                });
-
-                var srow = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .y = 6 } });
-                defer srow.deinit();
-
-                // Stat: processed
-                dvui.icon(@src(), "ok2", dvui.entypo.check, .{}, .{
-                    .min_size_content = .{ .h = 14, .w = 14 },
-                    .gravity_y = 0.5,
-                    .margin = .{ .w = 4 },
-                    .color_text = dvui.Color{ .r = 0x33, .g = 0xd1, .b = 0x7a },
-                });
-                dvui.label(@src(), "{d} / {d}", .{ s.done_count, s.total }, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } });
-                if (s.err_count > 0) {
-                    _ = dvui.spacer(@src(), .{ .min_size_content = .width(20) });
-                    dvui.icon(@src(), "err", dvui.entypo.circle_with_cross, .{}, .{
-                        .min_size_content = .{ .h = 14, .w = 14 },
-                        .gravity_y = 0.5,
-                        .margin = .{ .w = 4 },
-                        .color_text = dvui.Color{ .r = 0xff, .g = 0x6b, .b = 0x6b },
-                    });
-                    dvui.label(@src(), "{d} errors", .{s.err_count}, .{
-                        .gravity_y = 0.5,
-                        .color_text = dvui.Color{ .r = 0xff, .g = 0x6b, .b = 0x6b },
-                        .margin = .{ .x = 4 },
-                    });
-                }
-                _ = dvui.spacer(@src(), .{ .expand = .horizontal });
-                dvui.label(@src(), "{d:.0}%", .{pct * 100.0}, .{ .gravity_y = 0.5 });
-            }
-
-            // ── Activity log card ────────────────────────────────────────────
-            {
-                var c = Card.init(@src(), "Activity Log");
-                defer c.deinit();
-
-                var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both, .min_size_content = .{ .h = 140 } });
-                defer scroll.deinit();
-
-                if (s.log.items.len == 0 and s.status == .idle) {
-                    dvui.labelNoFmt(@src(), "  No activity yet. Pick a folder and press Start.", .{}, .{
-                        .color_text = dvui.Color{ .r = 0x80, .g = 0x80, .b = 0x80 },
-                        .margin = .{ .y = 4 },
-                    });
-                } else {
-                    for (s.log.items) |entry| {
-                        dvui.labelNoFmt(@src(), entry.msg, .{}, .{
-                            .expand = .horizontal,
-                            .font = dvui.Font.theme(.mono),
-                            .color_text = if (entry.err) dvui.Color{ .r = 0xff, .g = 0x6b, .b = 0x6b } else dvui.Color{ .r = 0x80, .g = 0xc0, .b = 0x80 },
-                        });
-                    }
-                }
-
-                if (s.status == .done) {
-                    _ = dvui.spacer(@src(), .{ .min_size_content = .height(6) });
-                    if (s.err_count > 0) {
-                        dvui.icon(@src(), "warn2", dvui.entypo.warning, .{}, .{
-                            .min_size_content = .{ .h = 16, .w = 16 },
-                            .gravity_y = 0.5,
-                            .margin = .{ .w = 4 },
-                            .color_text = dvui.Color{ .r = 0xff, .g = 0xc1, .b = 0x07 },
-                        });
-                        dvui.label(@src(), "Done — {d} files, {d} errors", .{ s.done_count, s.err_count }, .{
-                            .color_text = dvui.Color{ .r = 0xff, .g = 0xc1, .b = 0x07 },
-                            .font = dvui.Font.theme(.heading),
-                            .gravity_y = 0.5,
-                            .margin = .{ .x = 4 },
-                        });
-                    } else {
-                        dvui.icon(@src(), "ok3", dvui.entypo.check, .{}, .{
-                            .min_size_content = .{ .h = 16, .w = 16 },
-                            .gravity_y = 0.5,
-                            .margin = .{ .w = 4 },
-                            .color_text = dvui.Color{ .r = 0x33, .g = 0xd1, .b = 0x7a },
-                        });
-                        dvui.label(@src(), "Done — {d} files processed", .{s.done_count}, .{
-                            .color_text = dvui.Color{ .r = 0x33, .g = 0xd1, .b = 0x7a },
-                            .font = dvui.Font.theme(.heading),
-                            .gravity_y = 0.5,
-                            .margin = .{ .x = 4 },
-                        });
-                    }
-                }
-            }
-
-            // ── Footer ────────────────────────────────────────────────────────
-            _ = dvui.spacer(@src(), .{ .min_size_content = .height(2) });
-            var fbox = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
-            defer fbox.deinit();
-            _ = dvui.spacer(@src(), .{ .expand = .horizontal });
-            dvui.labelNoFmt(@src(), "rmdecrypt v" ++ VERSION ++ "  ·  RPG Maker MV/MZ decrypter", .{}, .{
-                .color_text = dvui.Color{ .r = 0x70, .g = 0x70, .b = 0x70 },
-                .font = dvui.Font.theme(.body),
-            });
-        }
-
-        // ── Per-frame batch processing ─────────────────────────────────────
-        if (s.status == .processing) {
-            const start = s.idx;
-            const end = @min(start + BATCH_SIZE, s.files.items.len);
-            if (start < end and s.output_list.items.len > 0) {
-                const out_path = s.output_list.items;
-                if (Dir.cwd().openDir(init.io, out_path, .{})) |od| {
-                    defer od.close(init.io);
-                    const inp = s.input_list.items;
-                    if (Dir.cwd().openDir(init.io, inp, .{ .iterate = true, .access_sub_paths = true })) |id| {
-                        defer id.close(init.io);
-                        for (s.files.items[start..end]) |fp| {
-                            processFile(gpa, init.io, id, od, &s, fp);
-                            s.done_count += 1;
-                        }
-                    } else |_| break;
-                } else |_| break;
-                s.idx = end;
-            }
-            if (s.done_count >= s.total)
-                s.status = .done;
-        }
-
-        const end_micros = try win.end(.{});
-        const wait_micros = win.waitTime(end_micros);
-        interrupted = try backend.waitEventTimeout(wait_micros);
+    g_job.decrypt = decrypt != 0;
+    g_job.mz = mz != 0;
+    g_job.ignore_header = ignore_header != 0;
+    g_job.overwrite = overwrite != 0;
+    g_job.clean_output = clean_output != 0;
+    if (!key_detect.validateKeyHex(hh)) {
+        logFmt("  x fake header must be exactly 32 hexadecimal characters", .{}, true);
+        return -1;
     }
+    const parsed_header = key_detect.hexKeyToBytes(hh, gpa) catch return -1;
+    defer gpa.free(parsed_header);
+    @memcpy(g_job.header[0..], parsed_header);
+    g_job.input = gpa.dupe(u8, ip) catch return -1;
+    g_job.output = gpa.dupe(u8, if (op.len > 0) op else ip) catch return -1;
+
+    if (g_job.clean_output) {
+        if (std.mem.eql(u8, g_job.input, g_job.output)) {
+            logFmt("  x refusing to clean an output folder that is also the input folder", .{}, true);
+            return -1;
+        }
+        Dir.cwd().deleteTree(io(), g_job.output) catch {
+            logFmt("  x could not clean output folder: {s}", .{g_job.output}, true);
+            return -1;
+        };
+    }
+
+    if (g_job.key.len == 0) {
+        const detected = key_detect.detectFromInput(io(), gpa, id) catch null;
+        if (detected) |found| {
+            defer gpa.free(found);
+            g_job.key = if (key_detect.validateKeyHex(found))
+                key_detect.hexKeyToBytes(found, gpa) catch return -1
+            else
+                gpa.dupe(u8, found) catch return -1;
+            logFmt("  + key auto-detected", .{}, false);
+        } else if (!g_job.decrypt) {
+            logFmt("  x encryption needs a key; auto-detection failed", .{}, true);
+            return -1;
+        }
+    }
+
+    var walker = id.walk(gpa) catch return -1;
+    defer walker.deinit();
+    while (true) {
+        const entry = walker.next(io()) catch break orelse break;
+        if (entry.kind != .file) continue;
+        const ed = Dir.path.extension(entry.basename);
+        if (ed.len == 0) continue;
+        if (g_job.decrypt) {
+            if (extensions.EncryptedExt.fromString(ed[1..]) != null)
+                g_job.files.append(gpa, gpa.dupe(u8, entry.path) catch continue) catch {};
+        } else {
+            if (extensions.NormalExt.fromString(ed[1..]) != null)
+                g_job.files.append(gpa, gpa.dupe(u8, entry.path) catch continue) catch {};
+        }
+    }
+    g_job.total = g_job.files.items.len;
+    if (g_job.total == 0) {
+        logFmt("  x no matching files found in that folder", .{}, true);
+        return 0;
+    }
+
+    Dir.cwd().createDirPath(io(), g_job.output) catch {
+        logFmt("  x could not create output folder: {s}", .{g_job.output}, true);
+        return -1;
+    };
+    logFmt("  -> found {d} files", .{g_job.total}, false);
+    return @intCast(g_job.total);
+}
+
+/// Processes up to `batch` files of the current job (called once per frame
+/// while the UI reports "processing").
+export fn rmd_zig_step(batch: c_int) void {
+    const start = g_job.idx;
+    const end = @min(start + @as(usize, @intCast(@max(1, batch))), g_job.files.items.len);
+    if (start >= end) return;
+
+    var od = Dir.cwd().openDir(io(), g_job.output, .{}) catch {
+        logFmt("  x cannot open output folder: {s}", .{g_job.output}, true);
+        g_job.idx = g_job.files.items.len;
+        g_job.done = g_job.total;
+        return;
+    };
+    defer od.close(io());
+    var id = Dir.cwd().openDir(io(), g_job.input, .{ .iterate = true, .access_sub_paths = true }) catch {
+        logFmt("  x cannot open input folder: {s}", .{g_job.input}, true);
+        g_job.idx = g_job.files.items.len;
+        g_job.done = g_job.total;
+        return;
+    };
+    defer id.close(io());
+
+    for (g_job.files.items[start..end]) |fp| {
+        processFile(id, od, fp);
+        g_job.done += 1;
+    }
+    g_job.idx = end;
+
+    if (g_job.done >= g_job.total) {
+        if (g_job.errors > 0) {
+            logFmt("  done - {d} files, {d} errors", .{ g_job.done, g_job.errors }, true);
+        } else {
+            logFmt("  done - {d} files processed", .{g_job.done}, false);
+        }
+    }
+}
+
+export fn rmd_zig_progress(done: *c_int, total: *c_int, errors: *c_int) void {
+    done.* = @intCast(g_job.done);
+    total.* = @intCast(g_job.total);
+    errors.* = @intCast(g_job.errors);
+}
+
+export fn rmd_zig_log(msg: [*:0]const u8, is_err: c_int) void {
+    logSlice(std.mem.sliceTo(msg, 0), is_err != 0);
+}
+
+export fn rmd_zig_log_count() c_int {
+    return @intCast(g_log.items.len);
+}
+
+export fn rmd_zig_log_get(i: c_int, is_err: *c_int) ?[*:0]const u8 {
+    if (i < 0 or i >= g_log.items.len) return null;
+    const e = g_log.items[@intCast(i)];
+    is_err.* = @intFromBool(e.err);
+    return e.msg.ptr;
+}
+
+export fn rmd_zig_log_clear() void {
+    for (g_log.items) |e| gpa.free(e.msg);
+    g_log.clearRetainingCapacity();
+}
+
+// ─── entry points (UI lives in gui_nk.c) ────────────────────────────────
+
+extern fn rmd_gui_main() c_int;
+
+pub fn main() u8 {
+    return @intCast(rmd_gui_main());
+}
+
+export fn WinMain(_: ?*anyopaque, _: ?*anyopaque, _: ?[*:0]u8, _: c_int) c_int {
+    return rmd_gui_main();
 }

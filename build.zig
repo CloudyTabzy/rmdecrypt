@@ -21,13 +21,7 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
 
-    // --- GUI executable (SDL2 backend) ---
-    const dvui_dep = b.dependency("dvui", .{
-        .target = target,
-        .optimize = optimize,
-        .backend = .sdl2,
-    });
-
+    // --- GUI executable (Nuklear + D3D11, native Win32) ---
     const gui = b.addExecutable(.{
         .name = "rmdecrypt-gui",
         .root_module = b.createModule(.{
@@ -35,8 +29,6 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "dvui", .module = dvui_dep.module("dvui_sdl2") },
-                .{ .name = "sdl2-backend", .module = dvui_dep.module("sdl2") },
                 .{ .name = "win32_folder_dialog", .module = b.createModule(.{
                     .root_source_file = b.path("src/win32_folder_dialog.zig"),
                     .target = target,
@@ -45,15 +37,19 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    // The GUI module declares extern "SDL2" (for drag-and-drop event
-    // polling). The sdl2-c Zig module produced by cImport uses -lSDL2
-    // when generating extern decls, and the linker can't find it in
-    // any default search path. Add the cache dir where dvui pre-
-    // extracted SDL2.lib to the linker search path.
+    gui.root_module.addIncludePath(b.path("vendor/nuklear"));
+    gui.root_module.addCSourceFile(.{ .file = b.path("src/nk_shim.c") });
+    gui.root_module.addCSourceFile(.{ .file = b.path("src/gui_nk.c") });
+    gui.root_module.link_libc = true;
     if (target.result.os.tag == .windows) {
-        gui.root_module.addLibraryPath(b.path(".zig-cache/o/b6880618b176c43a0f902caf7218f51d"));
+        gui.subsystem = .windows;
+        gui.root_module.linkSystemLibrary("user32", .{});
+        gui.root_module.linkSystemLibrary("gdi32", .{});
+        gui.root_module.linkSystemLibrary("d3d11", .{});
+        gui.root_module.linkSystemLibrary("dxguid", .{});
+        gui.root_module.linkSystemLibrary("shell32", .{});
+        gui.root_module.linkSystemLibrary("ole32", .{});
     }
-    if (target.result.os.tag == .windows) gui.root_module.linkSystemLibrary("ole32", .{});
     b.installArtifact(gui);
 
     const gui_run_step = b.step("gui", "Run the GUI");

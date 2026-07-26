@@ -4,15 +4,14 @@
 //!
 //!   1. **Modern IFileOpenDialog** (the same dialog File Explorer uses
 //!      to pick directories — complete with the navigation pane,
-//!      breadcrumbs, and search box). Requires the COM class to be
-//!      registered, which is normally done by `comdlg32.dll`. On Windows
-//!      11 Home the CLSID is `{DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7}`;
-//!      on older SDKs it is `{DC1C5A9C-E88A-4DDE-A5A1-41B19FE861D6}`.
+//!      breadcrumbs, and search box). Uses the standard documented
+//!      CLSID `{DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7}` implemented by
+//!      `comdlg32.dll` on every Windows version since Vista.
 //!
 //!   2. **SHBrowseForFolder** (shell32.dll) — the classic Windows
 //!      "Browse For Folder" dialog. Always available as long as the
 //!      Windows shell is present. Used as a fallback when the modern
-//!      dialog's COM class is missing (common on stripped Windows
+//!      dialog's COM class is genuinely missing (stripped Windows
 //!      installs and Windows Server Core variants).
 //!
 //!   3. **Returns null** so the caller can fall back to
@@ -30,7 +29,13 @@ pub fn selectFolder(alloc: std.mem.Allocator, title: ?[]const u8) !?[]u8 {
     }
 
     // 1. Modern IFileOpenDialog (file explorer's folder picker).
-    if (try selectFolderModern(alloc, title)) |p| return p;
+    const modern = selectFolderModern(alloc, title) catch |err| switch (err) {
+        // User pressed Cancel in the modern dialog: do NOT pop a second
+        // (legacy) dialog on top — just report the cancellation.
+        error.Canceled => return null,
+        else => return err,
+    };
+    if (modern) |p| return p;
     if (builtin.mode == .Debug) {
         std.debug.print("[folder_picker] falling back to SHBrowseForFolder\n", .{});
     }
@@ -72,10 +77,8 @@ const win = struct {
         Data4: [8]u8,
     };
 
-    // Windows 11 Home CLSID for "File Open Dialog". This is the version
-    // comdlg32.dll actually exports. The MSDN-documented GUID
-    // (Data4 = A5 A1 41 B1 9F E8 61 D6) is outdated and returns
-    // REGDB_E_CLASSNOTREG on Windows 11.
+    // Standard documented CLSID for the common "File Open Dialog"
+    // (comdlg32.dll). Verified against this machine's shobjidl.h.
     const CLSID_FileOpenDialog = GUID{
         .Data1 = 0xDC1C5A9C,
         .Data2 = 0xE88A,
@@ -83,11 +86,16 @@ const win = struct {
         .Data4 = .{ 0xA5, 0xA1, 0x60, 0xF8, 0x2A, 0x20, 0xAE, 0xF7 },
     };
 
+    // IID_IFileOpenDialog. Note: the last byte is 0x60 — the value
+    // ...D96E that circulates in many code samples and older docs is
+    // wrong and makes QueryInterface return E_NOINTERFACE. Verified
+    // against this machine's shobjidl.h: D57C7288-D4AD-4768-BE02-
+    // 9D969532D960.
     const IID_IFileOpenDialog = GUID{
         .Data1 = 0xD57C7288,
         .Data2 = 0xD4AD,
         .Data3 = 0x4768,
-        .Data4 = .{ 0xBE, 0x02, 0x9D, 0x96, 0x95, 0x32, 0xD9, 0x6E },
+        .Data4 = .{ 0xBE, 0x02, 0x9D, 0x96, 0x95, 0x32, 0xD9, 0x60 },
     };
 
     const VTable = extern struct {
@@ -111,7 +119,7 @@ const win = struct {
         SetTitle: *const fn (*anyopaque, LPCWSTR) callconv(.winapi) HRESULT,
         _p15: *const fn (...) callconv(.winapi) HRESULT,
         _p16: *const fn (...) callconv(.winapi) HRESULT,
-        GetResult: *const fn (*anyopaque, **anyopaque) callconv(.winapi) HRESULT,
+        GetResult: *const fn (*anyopaque, *?*anyopaque) callconv(.winapi) HRESULT,
         _p18: *const fn (...) callconv(.winapi) HRESULT,
         _p19: *const fn (...) callconv(.winapi) HRESULT,
         _p20: *const fn (...) callconv(.winapi) HRESULT,
@@ -138,7 +146,7 @@ const win = struct {
         pUnkOuter: ?*anyopaque,
         dwClsContext: u32,
         riid: REFIID,
-        ppv: **anyopaque,
+        ppv: *?*anyopaque,
     ) callconv(.winapi) HRESULT;
     extern "ole32" fn CoTaskMemFree(pv: ?*anyopaque) callconv(.winapi) void;
 };
@@ -155,20 +163,21 @@ fn selectFolderModern(alloc: std.mem.Allocator, title: ?[]const u8) !?[]u8 {
         return null;
     }
 
-    var dialog: *anyopaque = undefined;
+    var dialog_opt: ?*anyopaque = null;
     const hr_create = win.CoCreateInstance(
         &win.CLSID_FileOpenDialog,
         null,
         win.CLSCTX_ALL,
         &win.IID_IFileOpenDialog,
-        &dialog,
+        &dialog_opt,
     );
-    if (hr_create != win.S_OK or @intFromPtr(dialog) == 0) {
+    if (hr_create != win.S_OK or dialog_opt == null) {
         if (builtin.mode == .Debug) {
             std.debug.print("[folder_picker] CoCreateInstance failed: 0x{x:0>8}\n", .{hr_create});
         }
         return null;
     }
+    const dialog = dialog_opt.?;
     errdefer releaseCom(dialog);
 
     const vt_ptr: *usize = @ptrCast(@alignCast(dialog));
@@ -187,7 +196,7 @@ fn selectFolderModern(alloc: std.mem.Allocator, title: ?[]const u8) !?[]u8 {
     const hr_show = vt.Show(dialog, null);
     if (hr_show == win.ERROR_CANCELLED_HR) {
         releaseCom(dialog);
-        return null;
+        return error.Canceled;
     }
     if (hr_show != win.S_OK) {
         if (builtin.mode == .Debug) {
@@ -197,10 +206,11 @@ fn selectFolderModern(alloc: std.mem.Allocator, title: ?[]const u8) !?[]u8 {
         return null;
     }
 
-    var item: *anyopaque = undefined;
-    const hr_get = vt.GetResult(dialog, &item);
+    var item_opt: ?*anyopaque = null;
+    const hr_get = vt.GetResult(dialog, &item_opt);
     releaseCom(dialog);
-    if (hr_get != win.S_OK or @intFromPtr(item) == 0) return null;
+    if (hr_get != win.S_OK or item_opt == null) return null;
+    const item = item_opt.?;
 
     const item_vt_ptr: *usize = @ptrCast(@alignCast(item));
     const item_vt: *win.IShellItemVTable = @ptrFromInt(item_vt_ptr.*);

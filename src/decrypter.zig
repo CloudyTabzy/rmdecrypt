@@ -10,6 +10,13 @@ pub const PNG_HEADER: [16]u8 = .{
     0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
 };
 
+/// Checks a fake RPG Maker header against a caller-supplied expected value.
+/// This keeps compatibility handling explicit while retaining the standard
+/// header as the default.
+pub fn verifyHeaderAgainst(data: []const u8, expected: []const u8) bool {
+    return data.len >= expected.len and std.mem.eql(u8, data[0..expected.len], expected);
+}
+
 pub fn Decrypter(comptime header_len: comptime_int) type {
     return struct {
         const Self = @This();
@@ -80,6 +87,13 @@ test "header verification" {
     const D = DefaultDecrypter;
     try std.testing.expect(D.verifyHeader(&DEFAULT_HEADER));
     try std.testing.expect(!D.verifyHeader(&[_]u8{0} ** 16));
+}
+
+test "custom header verification" {
+    const custom = [_]u8{0xA5} ** 16;
+    try std.testing.expect(verifyHeaderAgainst(&custom, &custom));
+    try std.testing.expect(!verifyHeaderAgainst(&DEFAULT_HEADER, &custom));
+    try std.testing.expect(!verifyHeaderAgainst(custom[0..15], &custom));
 }
 
 test "decrypt roundtrip" {

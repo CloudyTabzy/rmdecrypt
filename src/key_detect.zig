@@ -150,7 +150,7 @@ fn isHexString(s: []const u8) bool {
 }
 
 pub fn validateKeyHex(s: []const u8) bool {
-    return isHexString(s) and s.len % 2 == 0 and s.len > 0;
+    return isHexString(s) and s.len == decrypter.DEFAULT_HEADER.len * 2;
 }
 
 pub fn hexKeyToBytes(key_hex: []const u8, allocator: std.mem.Allocator) ![]u8 {
