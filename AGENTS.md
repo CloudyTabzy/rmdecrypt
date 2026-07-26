@@ -118,6 +118,14 @@ zig build test
 zig build install -Doptimize=ReleaseFast --prefix zig-out
 ```
 
+### Locked build artifacts
+
+When a requested rebuild is blocked because a project-local executable is
+running, first verify the process path is inside this repository's
+`zig-out/bin/` directory. It is then authorized to terminate that verified
+process with `Stop-Process -Force` and rerun the build; do not terminate
+unrelated processes with the same executable name.
+
 ### Headless GUI self-test
 
 The GUI has an environment-driven self-test (no clicking required;

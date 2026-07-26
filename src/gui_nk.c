@@ -321,27 +321,14 @@ path_row(struct nk_context *ctx, const char *label, char *buf,
          const char *button, nk_plugin_filter filter)
 {
     int clicked;
-    struct nk_rect content = nk_window_get_content_region(ctx);
-    float label_w = 130.0f;
-    float button_w = 100.0f;
-    float edit_w;
-
-    /* Cap the path field on wide displays while shrinking all three cells
-     * together on narrow ones, avoiding any horizontal overflow. */
-    if (content.w < 420.0f) {
-        label_w = content.w * 0.35f;
-        button_w = content.w * 0.30f;
-    }
-    edit_w = content.w - label_w - button_w;
-    if (edit_w > 500.0f) edit_w = 500.0f;
-    if (edit_w < 1.0f) edit_w = 1.0f;
-
-    nk_layout_row_begin(ctx, NK_STATIC, 32, 3);
-    nk_layout_row_push(ctx, label_w);
+    /* Fill the available row while keeping each cell proportional, so the
+     * path/key field stays generous without imposing a fixed minimum width. */
+    nk_layout_row_begin(ctx, NK_DYNAMIC, 32, 3);
+    nk_layout_row_push(ctx, 0.14f);
     nk_label(ctx, label, NK_TEXT_LEFT);
-    nk_layout_row_push(ctx, edit_w);
+    nk_layout_row_push(ctx, 0.72f);
     nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, buf, BUF_LEN, filter);
-    nk_layout_row_push(ctx, button_w);
+    nk_layout_row_push(ctx, 0.14f);
     clicked = nk_button_label(ctx, button);
     nk_layout_row_end(ctx);
     return clicked;
