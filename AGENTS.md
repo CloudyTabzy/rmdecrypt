@@ -90,9 +90,10 @@ code byte‑identical to upstream Nuklear demo patterns.
   step, progress, log access) called from C; `main`/`WinMain` forward to
   `rmd_gui_main()`.
 
-Layout: input/output folder rows (Browse buttons + drag‑and‑drop), key
-field with auto‑detect, mode toggle (decrypt/encrypt + MV/MZ), progress
-bar, scrollable status log.
+Layout: responsive input/output folder rows (Browse buttons + drag-and-drop),
+key field with auto-detect, mode toggle (decrypt/encrypt + MV/MZ), progress
+bar, and a scrollable activity log. The main form scrolls vertically on
+smaller displays; avoid fixed-width controls that create horizontal overflow.
 
 The key field holds the key as a **32‑char hex string**; Zig converts it
 to raw bytes at scan time (`key_detect.hexKeyToBytes`).  Auto‑detect
@@ -145,13 +146,17 @@ rmdecrypt [options] <input_directory>
 
   --key, -k <hex>     32‑char hex encryption key
   --output, -o <dir>  Output directory (default: <input>_decrypted)
-  --ignore-header     Skip fake‑header verification warning
+  --ignore-header     Process files even when their fake header differs
+  --header <hex>      Expected 16-byte fake header (32 hex chars)
+  --overwrite         Replace output files that already exist
+  --clean-output      Delete the output directory before processing
+  --detect-key        Print a detected key and exit without writing files
   --encrypt, -e       Re‑encrypt plain assets back to RPG Maker format
   --mz                Use MZ extensions (.png_/.m4a_/.ogg_)
   --help, -h          Show this help
 ```
 
-Key auto‑detection (when `--key` is omitted):
+Key auto‑detection (when `--key` is omitted, including encryption):
 1. Read `encryptionKey` from `System.json` (walks tree, finds anywhere)
 2. Search `.js`/`.txt` files for `this._encryptionKey` assignment
 3. Derive key from the first encrypted PNG in the input tree

@@ -5,14 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-07-26
+
+### Added
+
+- First stable release of the native RPG Maker MV/MZ asset decryptor.
+- Native Windows GUI with folder pickers, drag-and-drop, automatic key
+  detection, MV/MZ encrypt/decrypt controls, safe output options, and a live
+  activity log.
+- CLI compatibility and safety controls: custom fake headers, strict header
+  verification, `--overwrite`, `--clean-output`, and `--detect-key`.
+
+### Changed
+
+- The GUI now uses larger DPI-aware fonts and responsive column sizing. Its
+  main form scrolls vertically on compact displays while the activity log
+  keeps an independent scrollbar for lengthy output.
+
+### Fixed
+
+- Encryption now scans plain assets correctly and can auto-detect a project
+  key when `--key` is omitted.
+- Keyless GUI decryptions restore PNG files instead of writing encrypted
+  payload bytes.
+
 ## [0.2.2] - 2026-07-26
 
 ### Changed
 
 - Enlarged all GUI fonts slightly while preserving DPI-aware scaling.
 - Made folder fields, headings, mode controls, progress text, and status rows
-  responsive; wide path fields are now capped instead of stretching across
-  the entire window.
+  responsive without imposing a fixed-width layout.
 
 ### Fixed
 

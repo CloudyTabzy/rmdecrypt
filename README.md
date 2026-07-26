@@ -2,7 +2,12 @@
 
 > A fast, native port of [Petschko's RPG-Maker-MV/MZ Decrypter](https://github.com/Petschko/RPG-Maker-MV-Decrypter) written in Zig 0.16.
 
-Decrypt (and re-encrypt) RPG Maker encrypted assets — images, audio, tilesets, and more — from the command line. No browser needed, no file picking, no ZIP downloads. Point it at a game folder and go.
+Decrypt (and re-encrypt) RPG Maker encrypted assets — images, audio, tilesets, and more — from the command line or a native Windows GUI. No browser, Java runtime, or ZIP workflow required. Point it at a game folder and go.
+
+## Version 1.0.0
+
+`v1.0.0` is the first stable release. It includes the complete MV/MZ asset
+workflow, automatic key discovery, safe output controls, and the native GUI.
 
 ## Features
 
@@ -36,7 +41,8 @@ zig build gui        # builds and launches zig-out/bin/rmdecrypt-gui.exe
 It offers folder pickers and drag-and-drop, key auto-detection (including
 encryption), a decrypt/encrypt mode toggle (MV/MZ), editable fake-header,
 header-verification, overwrite, and guarded clean-output controls, a progress
-bar, and a live activity log over the same core as the CLI.
+bar, responsive DPI-aware layout, and a live activity log over the same core
+as the CLI.
 
 ## Usage
 
@@ -59,6 +65,10 @@ Encrypt options:
   --key, -k <hex>     Encryption key (auto-detected when omitted)
   --output, -o <dir>  Output directory
 ```
+
+> `--clean-output` permanently removes the selected output directory before
+> processing. The tool rejects an identical input/output path, but verify the
+> output path before using this option.
 
 ### Examples
 

@@ -64,7 +64,7 @@ extern void rmd_zig_log_clear(void);
 
 /* ── UI state ─────────────────────────────────────────────────────────── */
 
-#define VERSION  "0.2.2"
+#define VERSION  "1.0.0"
 #define BUF_LEN  1024
 #define BATCH    15
 #define ROW_GAP  10.0f   /* must match ctx->style.window.spacing.y */
