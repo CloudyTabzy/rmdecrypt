@@ -254,18 +254,18 @@ nkshim_init(int width, int height, const char *title)
         UINT dpi = GetDpiForWindow(g_hwnd);
         float scale = (float)dpi / 96.0f;
         static const nk_rune mdl2_range[] = { 0xE700, 0xEA00, 0 };
-        struct nk_font_config icfg = nk_font_config(15.0f * scale);
+        struct nk_font_config icfg = nk_font_config(18.0f * scale);
         icfg.range = mdl2_range;
         g_fonts[NKSHIM_FONT_UI] = nk_font_atlas_add_from_file(atlas,
-            "C:\\Windows\\Fonts\\segoeui.ttf", 17.0f * scale, NULL);
+            "C:\\Windows\\Fonts\\segoeui.ttf", 20.0f * scale, NULL);
         g_fonts[NKSHIM_FONT_BOLD] = nk_font_atlas_add_from_file(atlas,
-            "C:\\Windows\\Fonts\\segoeuib.ttf", 17.0f * scale, NULL);
+            "C:\\Windows\\Fonts\\segoeuib.ttf", 20.0f * scale, NULL);
         g_fonts[NKSHIM_FONT_ITALIC] = nk_font_atlas_add_from_file(atlas,
-            "C:\\Windows\\Fonts\\segoeuii.ttf", 15.0f * scale, NULL);
+            "C:\\Windows\\Fonts\\segoeuii.ttf", 18.0f * scale, NULL);
         g_fonts[NKSHIM_FONT_TITLE] = nk_font_atlas_add_from_file(atlas,
-            "C:\\Windows\\Fonts\\segoeuib.ttf", 24.0f * scale, NULL);
+            "C:\\Windows\\Fonts\\segoeuib.ttf", 29.0f * scale, NULL);
         g_fonts[NKSHIM_FONT_ICONS] = nk_font_atlas_add_from_file(atlas,
-            "C:\\Windows\\Fonts\\segmdl2.ttf", 15.0f * scale, &icfg);
+            "C:\\Windows\\Fonts\\segmdl2.ttf", 18.0f * scale, &icfg);
         nk_d3d11_font_stash_end();
         if (g_fonts[NKSHIM_FONT_UI])
             nk_style_set_font(ctx, &g_fonts[NKSHIM_FONT_UI]->handle);

@@ -64,7 +64,7 @@ extern void rmd_zig_log_clear(void);
 
 /* ── UI state ─────────────────────────────────────────────────────────── */
 
-#define VERSION  "0.2.1"
+#define VERSION  "0.2.2"
 #define BUF_LEN  1024
 #define BATCH    15
 #define ROW_GAP  10.0f   /* must match ctx->style.window.spacing.y */
@@ -287,12 +287,12 @@ static void
 heading(struct nk_context *ctx, unsigned icon, const char *text)
 {
     int p;
-    nk_layout_row_begin(ctx, NK_STATIC, 28, 2);
-    nk_layout_row_push(ctx, 22);
+    nk_layout_row_begin(ctx, NK_DYNAMIC, 28, 2);
+    nk_layout_row_push(ctx, 0.06f);
     p = push_font(ctx, f_icons);
     nk_label_colored(ctx, ico(icon), NK_TEXT_LEFT, accent);
     if (p) nk_style_pop_font(ctx);
-    nk_layout_row_push(ctx, 400);
+    nk_layout_row_push(ctx, 0.94f);
     p = push_font(ctx, f_bold);
     nk_label_colored(ctx, text, NK_TEXT_LEFT, heading_col);
     if (p) nk_style_pop_font(ctx);
@@ -305,12 +305,12 @@ status_line(struct nk_context *ctx, unsigned icon, const char *text,
             struct nk_color col)
 {
     int p;
-    nk_layout_row_begin(ctx, NK_STATIC, 20, 2);
-    nk_layout_row_push(ctx, 22);
+    nk_layout_row_begin(ctx, NK_DYNAMIC, 24, 2);
+    nk_layout_row_push(ctx, 0.06f);
     p = push_font(ctx, f_icons);
     nk_label_colored(ctx, ico(icon), NK_TEXT_LEFT, col);
     if (p) nk_style_pop_font(ctx);
-    nk_layout_row_push(ctx, 900);
+    nk_layout_row_push(ctx, 0.94f);
     nk_label_colored(ctx, text, NK_TEXT_LEFT, col);
     nk_layout_row_end(ctx);
 }
@@ -321,12 +321,27 @@ path_row(struct nk_context *ctx, const char *label, char *buf,
          const char *button, nk_plugin_filter filter)
 {
     int clicked;
-    nk_layout_row_begin(ctx, NK_DYNAMIC, 32, 3);
-    nk_layout_row_push(ctx, 0.14f);
+    struct nk_rect content = nk_window_get_content_region(ctx);
+    float label_w = 130.0f;
+    float button_w = 100.0f;
+    float edit_w;
+
+    /* Cap the path field on wide displays while shrinking all three cells
+     * together on narrow ones, avoiding any horizontal overflow. */
+    if (content.w < 420.0f) {
+        label_w = content.w * 0.35f;
+        button_w = content.w * 0.30f;
+    }
+    edit_w = content.w - label_w - button_w;
+    if (edit_w > 500.0f) edit_w = 500.0f;
+    if (edit_w < 1.0f) edit_w = 1.0f;
+
+    nk_layout_row_begin(ctx, NK_STATIC, 32, 3);
+    nk_layout_row_push(ctx, label_w);
     nk_label(ctx, label, NK_TEXT_LEFT);
-    nk_layout_row_push(ctx, 0.72f);
+    nk_layout_row_push(ctx, edit_w);
     nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, buf, BUF_LEN, filter);
-    nk_layout_row_push(ctx, 0.14f);
+    nk_layout_row_push(ctx, button_w);
     clicked = nk_button_label(ctx, button);
     nk_layout_row_end(ctx);
     return clicked;
@@ -342,23 +357,26 @@ draw(struct nk_context *ctx, float win_w, float win_h)
      * 0 without pushing a panel (unbalanced nk_group_end -> assert). */
     if (win_w < 1.0f || win_h < 1.0f)
         return;
+    /* Let the entire form scroll when a small window or high-DPI scaling
+     * makes the activity panel fall below the visible client area. The log
+     * itself keeps its own scrollbar for long operation output. */
     if (nk_begin(ctx, "main", nk_rect(0, 0, win_w, win_h),
-            NK_WINDOW_NO_SCROLLBAR | NK_WINDOW_BACKGROUND))
+            NK_WINDOW_BORDER | NK_WINDOW_SCROLL_AUTO_HIDE | NK_WINDOW_BACKGROUND))
     {
         float used = 0;
         int p;
 
         /* header: icon + title + dark/light toggle */
-        nk_layout_row_begin(ctx, NK_STATIC, 34, 3);
-        nk_layout_row_push(ctx, 32);
+        nk_layout_row_begin(ctx, NK_DYNAMIC, 40, 3);
+        nk_layout_row_push(ctx, 0.06f);
         p = push_font(ctx, f_icons);
         nk_label_colored(ctx, ico(ICON_UNLOCK), NK_TEXT_LEFT, accent);
         if (p) nk_style_pop_font(ctx);
-        nk_layout_row_push(ctx, win_w - 116.0f);
+        nk_layout_row_push(ctx, 0.88f);
         p = push_font(ctx, f_title);
         nk_label(ctx, "rmdecrypt", NK_TEXT_LEFT);
         if (p) nk_style_pop_font(ctx);
-        nk_layout_row_push(ctx, 38);
+        nk_layout_row_push(ctx, 0.06f);
         p = push_font(ctx, f_icons);
         if (nk_button_label(ctx, ico(g.dark ? ICON_SUN : ICON_MOON))) {
             g.dark = !g.dark;
@@ -376,7 +394,7 @@ draw(struct nk_context *ctx, float win_w, float win_h)
 
         nk_layout_row_dynamic(ctx, 8, 1);
         nk_spacing(ctx, 1);
-        used += 34 + 20 + 8 + 3 * ROW_GAP;
+        used += 40 + 20 + 8 + 3 * ROW_GAP;
 
         /* folders */
         heading(ctx, ICON_FOLDER, "Folders");
@@ -422,18 +440,18 @@ draw(struct nk_context *ctx, float win_w, float win_h)
 
         /* options */
         heading(ctx, ICON_GEAR, "Options");
-        nk_layout_row_begin(ctx, NK_STATIC, 28, 6);
-        nk_layout_row_push(ctx, 60);
+        nk_layout_row_begin(ctx, NK_DYNAMIC, 28, 6);
+        nk_layout_row_push(ctx, 0.14f);
         nk_label(ctx, "Mode", NK_TEXT_LEFT);
-        nk_layout_row_push(ctx, 100);
+        nk_layout_row_push(ctx, 0.22f);
         if (nk_option_label(ctx, "Decrypt", g.mode_decrypt)) g.mode_decrypt = 1;
-        nk_layout_row_push(ctx, 100);
+        nk_layout_row_push(ctx, 0.22f);
         if (nk_option_label(ctx, "Encrypt", !g.mode_decrypt)) g.mode_decrypt = 0;
-        nk_layout_row_push(ctx, 70);
+        nk_layout_row_push(ctx, 0.16f);
         nk_label(ctx, "Format", NK_TEXT_LEFT);
-        nk_layout_row_push(ctx, 60);
+        nk_layout_row_push(ctx, 0.13f);
         if (nk_option_label(ctx, "MV", !g.mz)) g.mz = 0;
-        nk_layout_row_push(ctx, 60);
+        nk_layout_row_push(ctx, 0.13f);
         if (nk_option_label(ctx, "MZ", g.mz)) g.mz = 1;
         nk_layout_row_end(ctx);
 
@@ -513,18 +531,18 @@ draw(struct nk_context *ctx, float win_w, float win_h)
                 nk_progress(ctx, &cur, (nk_size)total, nk_false);
             }
 
-            nk_layout_row_begin(ctx, NK_STATIC, 20, 3);
-            nk_layout_row_push(ctx, 150);
+            nk_layout_row_begin(ctx, NK_DYNAMIC, 24, 3);
+            nk_layout_row_push(ctx, 0.36f);
             snprintf(stbuf, sizeof(stbuf), "%d / %d processed", done, total);
             nk_label(ctx, stbuf, NK_TEXT_LEFT);
-            nk_layout_row_push(ctx, 130);
+            nk_layout_row_push(ctx, 0.28f);
             if (errors > 0) {
                 snprintf(stbuf, sizeof(stbuf), "%d errors", errors);
                 nk_label_colored(ctx, stbuf, NK_TEXT_LEFT, err_col);
             } else {
                 nk_label(ctx, "", NK_TEXT_LEFT);
             }
-            nk_layout_row_push(ctx, 200);
+            nk_layout_row_push(ctx, 0.36f);
             snprintf(stbuf, sizeof(stbuf), "%d%%",
                      total > 0 ? (done * 100) / total : 0);
             nk_label_colored(ctx, stbuf, NK_TEXT_RIGHT, accent);
@@ -532,7 +550,7 @@ draw(struct nk_context *ctx, float win_w, float win_h)
 
             if (g.status == ST_PROCESSING && done >= total)
                 g.status = ST_DONE;
-            used += 18 + 20 + 2 * ROW_GAP;
+            used += 18 + 24 + 2 * ROW_GAP;
         }
 
         /* activity log (fills remaining space) */

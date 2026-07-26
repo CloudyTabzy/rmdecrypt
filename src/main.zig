@@ -6,7 +6,7 @@ const key_detect = @import("key_detect.zig");
 
 const D = decrypter.DefaultDecrypter;
 
-const VERSION = "0.2.1";
+const VERSION = "0.2.2";
 const HEADER_LEN = decrypter.DEFAULT_HEADER.len;
 
 const CliResult = struct {
