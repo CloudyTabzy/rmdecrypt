@@ -193,29 +193,35 @@ fn writeOutput(output_dir: Dir, io: std.Io, path: []const u8, data: []const u8, 
 fn processOneFile(io: std.Io, gpa: std.mem.Allocator, input_dir: Dir, output_dir: Dir, entry_path: []const u8, key_bytes: ?[]const u8, ignore_header: bool, header: [HEADER_LEN]u8, overwrite: bool, encrypt_mode: bool, mz_mode: bool) !void {
     const ext_with_dot = Dir.path.extension(entry_path);
     if (ext_with_dot.len == 0) return;
-    const ext = ext_with_dot[1..];
+
+    var stack_buf: [256 * 1024]u8 = undefined;
+
+    var in_file = try input_dir.openFile(io, entry_path, .{ .mode = .read_only });
+    defer in_file.close(io);
+
+    const file_size = (try in_file.stat(io)).size;
+
+    const data: []u8 = if (file_size <= stack_buf.len)
+        stack_buf[0..file_size]
+    else
+        try gpa.alloc(u8, file_size);
+    defer if (file_size > stack_buf.len) gpa.free(data);
+
+    const n = try in_file.readPositionalAll(io, data, 0);
+    if (n == 0) return;
+
+    try processFileData(io, gpa, output_dir, entry_path, data[0..n], key_bytes, ignore_header, header, overwrite, encrypt_mode, mz_mode);
+}
+
+fn processFileData(io: std.Io, gpa: std.mem.Allocator, output_dir: Dir, entry_path: []const u8, data: []u8, key_bytes: ?[]const u8, ignore_header: bool, header: [HEADER_LEN]u8, overwrite: bool, encrypt_mode: bool, mz_mode: bool) !void {
+    var path_buf: [2048]u8 = undefined;
 
     if (encrypt_mode) {
-        const norm_ext = extensions.NormalExt.fromString(ext) orelse return;
+        const norm_ext = extensions.NormalExt.fromString(Dir.path.extension(entry_path)[1..]) orelse return;
         const key = key_bytes orelse return;
 
-        var in_file = try input_dir.openFile(io, entry_path, .{ .mode = .read_only });
-        defer in_file.close(io);
-        const file_size = (try in_file.stat(io)).size;
-        const data = try gpa.alloc(u8, file_size);
-        defer gpa.free(data);
-        var rdr = in_file.reader(io, &.{});
-        try rdr.interface.readSliceAll(data);
-
-        var path_buf: [2048]u8 = undefined;
         const dot = std.mem.lastIndexOfScalar(u8, entry_path, '.') orelse entry_path.len;
         const out_path = try std.fmt.bufPrint(&path_buf, "{s}.{s}", .{ entry_path[0..dot], norm_ext.encryptedExt(mz_mode) });
-
-        const dirname = Dir.path.dirname(out_path);
-        if (dirname) |parent| {
-            if (parent.len > 0)
-                output_dir.createDirPath(io, parent) catch {};
-        }
 
         for (0..@min(data.len, key.len)) |i| data[i] ^= key[i];
         const out = try std.mem.concat(gpa, u8, &.{ header[0..], data });
@@ -224,27 +230,14 @@ fn processOneFile(io: std.Io, gpa: std.mem.Allocator, input_dir: Dir, output_dir
         return;
     }
 
-    const enc_ext = extensions.EncryptedExt.fromString(ext) orelse return;
-
-    var in_file = try input_dir.openFile(io, entry_path, .{ .mode = .read_only });
-    defer in_file.close(io);
-    const file_size = (try in_file.stat(io)).size;
-    const data = try gpa.alloc(u8, file_size);
-    defer gpa.free(data);
-    var reader = in_file.reader(io, &.{});
-    try reader.interface.readSliceAll(data);
+    const ext = Dir.path.extension(entry_path);
+    if (ext.len == 0) return;
+    const enc_ext = extensions.EncryptedExt.fromString(ext[1..]) orelse return;
 
     if (data.len < HEADER_LEN) return error.FileTooSmall;
 
     const dot = std.mem.lastIndexOfScalar(u8, entry_path, '.') orelse entry_path.len;
-    var path_buf: [2048]u8 = undefined;
     const out_path = try std.fmt.bufPrint(&path_buf, "{s}.{s}", .{ entry_path[0..dot], enc_ext.normalExt() });
-
-    const dirname = Dir.path.dirname(out_path);
-    if (dirname) |parent| {
-        if (parent.len > 0)
-            output_dir.createDirPath(io, parent) catch {};
-    }
 
     if (key_bytes) |key| {
         if (!ignore_header and !decrypter.verifyHeaderAgainst(data, header[0..])) return error.InvalidHeader;
@@ -425,7 +418,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Phase 3: parallel processing
     const n_cpus = try std.Thread.getCpuCount();
-    const n_workers = @min(n_cpus, 8);
+    const n_workers = @min(n_cpus, 6);
 
     var next = std.atomic.Value(usize).init(0);
     var processed = std.atomic.Value(usize).init(0);

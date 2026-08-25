@@ -18,7 +18,7 @@ workflow, automatic key discovery, safe output controls, and the native GUI.
 - **Recursive** — processes entire directory trees preserving folder structure
 - **Compatibility controls** — verifies RPG Maker fake headers by default; accepts a custom 16-byte header when needed
 - **Safe outputs** — refuses to replace existing output files unless explicitly told to overwrite or clean the output directory
-- **Fast** — processes 27 MB of assets (~960 files) in ~0.3s
+- **Fast** — processes 27 MB of assets (~960 files) in ~0.15s (3× faster than Node.js)
 
 ## Build
 
@@ -113,19 +113,22 @@ RPG Maker's built-in encryption is a simple XOR scheme, not a strong cipher:
 
 > Tested on a Windows desktop, Ryzen 5 5600, NVMe SSD, 961 encrypted files (27.37 MB total) from a real game. Zig built with `-Doptimize=ReleaseFast`.
 
-| Build | Avg time | Throughput | vs Node.js |
+| Build | P50 time | Throughput | vs Node.js |
 |-------|----------|------------|------------|
 | Zig Debug | 455 ms | 60 MB/s | 0.6× slower |
 | Zig ReleaseFast (sequential) | 251 ms | 109 MB/s | 1.4× faster |
-| **Zig ReleaseFast (parallel)** | **213 ms** | **128 MB/s** | **2.4× faster** |
-| Node.js (reference) | 506 ms | 54 MB/s | 1× baseline |
+| **Zig ReleaseFast (parallel)** | **152 ms** | **180 MB/s** | **3.1× faster** |
+| Node.js (reference) | 482 ms | 57 MB/s | 1× baseline |
 
 Optimization progression:
 
 1. **XOR in-place** — eliminated the `allocator.dupe()` that copied every file's payload before XORing. Saved one allocation + copy per file.
 2. **Directory cache** — `StringHashMap` tracking already-created parent directories, slashing redundant `mkdir` syscalls.
 3. **Stack-allocated paths** — `bufPrint` on a 2 KB stack buffer instead of heap `concat` for every output path.
-4. **Parallel workers** — per-thread `Io.Threaded` instances + atomic work-stealing across 8 workers. Each worker gets its own I/O completion port, allowing true concurrent file I/O.
+4. **Parallel workers** — per-thread `Io.Threaded` instances + atomic work-stealing across 6 workers. Each worker gets its own I/O completion port, allowing true concurrent file I/O.
+5. **Stack-allocated file buffers** — 256 KB stack buffer per worker eliminates heap alloc/free for >99% of files (typical RPG Maker assets are 2–50 KB).
+6. **Reduced syscalls** — replaced `stat` + `open` + `reader` + `readSliceAll` (4+ syscalls) with a single `open` + `stat` + `readPositionalAll` (3 syscalls). Removed redundant per-file `createDirPath` calls (dirs already pre-created in Phase 2).
+7. **Direct file I/O** — uses `readPositionalAll` instead of the `reader` abstraction, avoiding the I/O buffer layer overhead.
 
 ## License
 

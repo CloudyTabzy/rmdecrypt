@@ -55,18 +55,18 @@ RPG Maker's "encryption" is a trivial XOR of the first 16 payload bytes:
 
 ### Parallel I/O
 The CLI uses per‑thread `Io.Threaded` instances + atomic work‑stealing
-across 8 workers.  Each worker gets its own I/O completion port, enabling
+across 6 workers.  Each worker gets its own I/O completion port, enabling
 true concurrent file I/O on Windows.
 
 The GUI processes files in‑frame (15 per frame) to keep the UI responsive
 without threading complexity.
 
 ### Performance
-| Build | Time (961 files / 27 MB) | vs Node.js |
+| Build | P50 time (961 files / 27 MB) | vs Node.js |
 |---|---|---|
 | Debug | 455 ms | 0.6× |
 | ReleaseFast (sequential) | 251 ms | 1.4× |
-| **ReleaseFast (parallel)** | **213 ms** | **2.4×** |
+| **ReleaseFast (parallel)** | **152 ms** | **3.1×** |
 
 ### Nuklear GUI (C UI / Zig logic split)
 The GUI follows the same architecture as the sibling `btworkshop_zig`
