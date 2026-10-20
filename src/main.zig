@@ -1,460 +1,296 @@
 const std = @import("std");
-const Dir = std.Io.Dir;
-const extensions = @import("extensions.zig");
+const builtin = @import("builtin");
+const Io = std.Io;
+const Dir = Io.Dir;
 const decrypter = @import("decrypter.zig");
 const key_detect = @import("key_detect.zig");
+const processor = @import("processor.zig");
 
-const D = decrypter.DefaultDecrypter;
+const VERSION = "1.2.0";
 
-const VERSION = "1.0.0";
-const HEADER_LEN = decrypter.DEFAULT_HEADER.len;
+/// Exit codes: 0 = success, 1 = runtime failure (including any file that
+/// could not be processed), 2 = invalid command line.
+const exit_failure: u8 = 1;
+const exit_usage: u8 = 2;
 
-const CliResult = struct {
-    input_dir: []const u8,
-    output_dir: []const u8,
-    key_hex: ?[]const u8,
-    key_valid: bool,
-    no_key_mode: bool,
-    ignore_header: bool,
-    header: [HEADER_LEN]u8,
-    overwrite: bool,
-    clean_output: bool,
-    detect_key_only: bool,
-    encrypt_mode: bool,
-    mz_mode: bool,
-    help: bool,
+/// At most this many per-file failures are listed individually.
+const max_reported_failures = 20;
+
+const Cli = struct {
+    input_dir: []const u8 = "",
+    output_dir: ?[]const u8 = null,
+    key: ?decrypter.Key = null,
+    header: decrypter.Header = decrypter.DEFAULT_HEADER,
+    ignore_header: bool = false,
+    overwrite: bool = false,
+    clean_output: bool = false,
+    detect_key_only: bool = false,
+    encrypt: bool = false,
+    mz: bool = false,
+    jobs: ?usize = null,
+    help: bool = false,
 };
 
-fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !CliResult {
-    var input_dir: ?[]const u8 = null;
-    var output_dir: ?[]const u8 = null;
-    var key_hex: ?[]const u8 = null;
-    var ignore_header = false;
-    var header = decrypter.DEFAULT_HEADER;
-    var overwrite = false;
-    var clean_output = false;
-    var detect_key_only = false;
-    var encrypt_mode = false;
-    var mz_mode = false;
-    var help = false;
+const ParseError = error{InvalidArgs};
 
+fn parseArgs(args: []const [:0]const u8) ParseError!Cli {
+    var cli: Cli = .{};
+    var input: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            help = true;
-        } else if (std.mem.eql(u8, arg, "--key") or std.mem.eql(u8, arg, "-k")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("error: --key requires a hex key argument\n", .{});
-                help = true;
-                continue;
-            }
-            key_hex = args[i];
-        } else if (std.mem.eql(u8, arg, "--output") or std.mem.eql(u8, arg, "-o")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("error: --output requires a directory argument\n", .{});
-                help = true;
-                continue;
-            }
-            output_dir = args[i];
-        } else if (std.mem.eql(u8, arg, "--ignore-header")) {
-            ignore_header = true;
+        const arg: []const u8 = args[i];
+        if (eqlAny(arg, &.{ "--help", "-h" })) {
+            cli.help = true;
+        } else if (eqlAny(arg, &.{ "--key", "-k" })) {
+            const v = try value(args, &i, arg);
+            cli.key = decrypter.parseHex16(v) orelse
+                return usageError("--key must be exactly 32 hex characters (got {d})", .{v.len});
+        } else if (eqlAny(arg, &.{ "--output", "-o" })) {
+            cli.output_dir = try value(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--header")) {
-            i += 1;
-            if (i >= args.len or !parseHeader(args[i], &header)) {
-                std.debug.print("error: --header requires exactly {d} hex characters\n", .{HEADER_LEN * 2});
-                help = true;
-            }
+            cli.header = decrypter.parseHex16(try value(args, &i, arg)) orelse
+                return usageError("--header must be exactly 32 hex characters", .{});
+        } else if (eqlAny(arg, &.{ "--jobs", "-j" })) {
+            const v = try value(args, &i, arg);
+            const n = std.fmt.parseInt(usize, v, 10) catch 0;
+            if (n == 0 or n > processor.max_jobs)
+                return usageError("--jobs must be between 1 and {d}", .{processor.max_jobs});
+            cli.jobs = n;
+        } else if (std.mem.eql(u8, arg, "--ignore-header")) {
+            cli.ignore_header = true;
         } else if (std.mem.eql(u8, arg, "--overwrite")) {
-            overwrite = true;
+            cli.overwrite = true;
         } else if (std.mem.eql(u8, arg, "--clean-output")) {
-            clean_output = true;
+            cli.clean_output = true;
         } else if (std.mem.eql(u8, arg, "--detect-key")) {
-            detect_key_only = true;
-        } else if (std.mem.eql(u8, arg, "--encrypt") or std.mem.eql(u8, arg, "-e")) {
-            encrypt_mode = true;
+            cli.detect_key_only = true;
+        } else if (eqlAny(arg, &.{ "--encrypt", "-e" })) {
+            cli.encrypt = true;
         } else if (std.mem.eql(u8, arg, "--mz")) {
-            mz_mode = true;
-        } else if (input_dir == null) {
-            input_dir = arg;
+            cli.mz = true;
+        } else if (arg.len > 1 and arg[0] == '-') {
+            return usageError("unknown option: {s}", .{arg});
+        } else if (input == null) {
+            input = arg;
         } else {
-            std.debug.print("error: unexpected argument: {s}\n", .{arg});
-            help = true;
+            return usageError("unexpected argument: {s}", .{arg});
         }
     }
-
-    if (!help and input_dir == null) {
-        std.debug.print("error: input directory is required\n", .{});
-        help = true;
-    }
-
-    var key_valid = false;
-    var no_key_mode = false;
-    if (key_hex) |k| {
-        key_valid = key_detect.validateKeyHex(k);
-        if (!key_valid) {
-            std.debug.print("error: key must be a valid hex string (even length, 0-9 a-f A-F)\n", .{});
-        }
-    } else if (!help) {
-        no_key_mode = true;
-    }
-
-    const in = input_dir orelse "";
-    const out = if (output_dir) |o| o else try std.mem.concat(allocator, u8, &.{ in, "_decrypted" });
-
-    return CliResult{
-        .input_dir = in,
-        .output_dir = out,
-        .key_hex = key_hex,
-        .key_valid = key_valid,
-        .no_key_mode = no_key_mode,
-        .ignore_header = ignore_header,
-        .header = header,
-        .overwrite = overwrite,
-        .clean_output = clean_output,
-        .detect_key_only = detect_key_only,
-        .encrypt_mode = encrypt_mode,
-        .mz_mode = mz_mode,
-        .help = help,
-    };
+    if (cli.help) return cli;
+    cli.input_dir = input orelse return usageError("input directory is required", .{});
+    return cli;
 }
 
-fn parseHeader(hex: []const u8, out: *[HEADER_LEN]u8) bool {
-    if (hex.len != HEADER_LEN * 2 or !key_detect.validateKeyHex(hex)) return false;
-    for (out, 0..) |*byte, i| {
-        byte.* = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch return false;
-    }
-    return true;
+fn eqlAny(arg: []const u8, names: []const []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, arg, n)) return true;
+    return false;
 }
 
-test "parse custom fake header" {
-    var header = decrypter.DEFAULT_HEADER;
-    try std.testing.expect(parseHeader("a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5", &header));
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xA5} ** HEADER_LEN), &header);
-    try std.testing.expect(!parseHeader("a5", &header));
+fn value(args: []const [:0]const u8, i: *usize, flag: []const u8) ParseError![]const u8 {
+    i.* += 1;
+    if (i.* >= args.len) return usageError("{s} requires a value", .{flag});
+    return args[i.*];
+}
+
+fn usageError(comptime fmt: []const u8, args: anytype) ParseError {
+    // Tests exercise the error paths; keep their stderr clean.
+    if (!builtin.is_test) std.debug.print("error: " ++ fmt ++ "\n(run with --help for usage)\n", args);
+    return error.InvalidArgs;
+}
+
+/// `<input>_decrypted` / `<input>_encrypted`, ignoring trailing separators so
+/// `game/` does not turn into `game/_decrypted` inside the input.
+fn defaultOutputDir(arena: std.mem.Allocator, input: []const u8, encrypt: bool) ![]const u8 {
+    const trimmed = std.mem.trimEnd(u8, input, "/\\");
+    const base = if (trimmed.len == 0 or (trimmed.len == 2 and trimmed[1] == ':')) input else trimmed;
+    return std.mem.concat(arena, u8, &.{ base, if (encrypt) "_encrypted" else "_decrypted" });
+}
+
+test "parse arguments" {
+    const t = std.testing;
+    const cli = try parseArgs(&.{ "rmdecrypt", "-k", "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6", "--header", "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5", "-j", "3", "game", "--mz", "-e" });
+    try t.expectEqualStrings("game", cli.input_dir);
+    try t.expectEqual(@as(u8, 0xa1), cli.key.?[0]);
+    try t.expectEqualSlices(u8, &([_]u8{0xA5} ** 16), &cli.header);
+    try t.expectEqual(@as(?usize, 3), cli.jobs);
+    try t.expect(cli.encrypt and cli.mz);
+    try t.expect((try parseArgs(&.{ "rmdecrypt", "--help" })).help);
+    try t.expectError(error.InvalidArgs, parseArgs(&.{ "rmdecrypt", "--key", "abcd", "game" }));
+    try t.expectError(error.InvalidArgs, parseArgs(&.{ "rmdecrypt", "--verbose", "game" }));
+    try t.expectError(error.InvalidArgs, parseArgs(&.{ "rmdecrypt", "a", "b" }));
+    try t.expectError(error.InvalidArgs, parseArgs(&.{"rmdecrypt"}));
+    try t.expectError(error.InvalidArgs, parseArgs(&.{ "rmdecrypt", "game", "-j", "0" }));
+    try t.expectError(error.InvalidArgs, parseArgs(&.{ "rmdecrypt", "game", "-o" }));
+}
+
+test "default output dir" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try t.expectEqualStrings("game_decrypted", try defaultOutputDir(a, "game", false));
+    try t.expectEqualStrings("C:\\x\\game_encrypted", try defaultOutputDir(a, "C:\\x\\game\\", true));
+    try t.expectEqualStrings("game_decrypted", try defaultOutputDir(a, "game//", false));
 }
 
 fn printUsage() void {
     const usage =
-        \\rmdecrypt v{s} - RPG Maker asset decryptor
+        \\rmdecrypt v{s} - RPG Maker MV/MZ asset decryptor
         \\
         \\Usage:
         \\  rmdecrypt [options] <input_directory>
         \\
-        \\Decrypt options (default):
-        \\  --key, -k <hex>     32-char hex encryption key
-        \\  --output, -o <dir>  Output directory (default: <input>_decrypted)
+        \\Options:
+        \\  --key, -k <hex>     32-char hex encryption key (auto-detected when omitted)
+        \\  --output, -o <dir>  Output directory (default: <input>_decrypted / _encrypted)
+        \\  --encrypt, -e       Re-encrypt plain .png/.m4a/.ogg back to RPG Maker format
+        \\  --mz                With --encrypt: write MZ extensions (.png_/.m4a_/.ogg_)
         \\  --ignore-header     Process files even when their fake header differs
-        \\  --header <hex>      Expected 16-byte fake header (32 hex chars)
+        \\  --header <hex>      Fake header to expect / write (32 hex chars)
         \\  --overwrite         Replace output files that already exist
-        \\  --clean-output      Delete the output directory before processing
-        \\  --detect-key        Print a detected key and exit without writing files
+        \\  --clean-output      Delete the output directory first (refused if it
+        \\                      overlaps the input directory)
+        \\  --detect-key        Print the detected key to stdout and exit
+        \\  --jobs, -j <n>      Worker threads (default: {d})
         \\  --help, -h          Show this help
         \\
-        \\Encrypt options:
-        \\  --encrypt, -e       Re-encrypt plain assets back to RPG Maker format
-        \\  --mz                Use MZ extensions (.png_/.m4a_/.ogg_) instead of MV
-        \\  --key, -k <hex>     Encryption key (auto-detected when omitted)
-        \\  --output, -o <dir>  Output directory
-        \\
         \\Key detection (when --key is omitted):
-        \\  1. Read encryptionKey from System.json (walks tree, finds anywhere)
-        \\  2. Search .js/.txt files for this._encryptionKey assignment
-        \\  3. Derive key from the first encrypted PNG in the input tree
-        \\  4. If nothing works, PNG files are restored without a key,
-        \\     audio files are skipped
+        \\  1. encryptionKey in System.json (known locations, then anywhere)
+        \\  2. this._encryptionKey = "..." in a .js/.txt file
+        \\  3. derived from the first encrypted PNG
+        \\  Without a key, PNGs are restored from their known header and audio
+        \\  files are reported as failures; --encrypt requires a key.
+        \\
+        \\Exit status: 0 success, 1 failure (any file not processed), 2 usage error.
         \\
     ;
-    std.debug.print(usage, .{VERSION});
+    std.debug.print(usage, .{ VERSION, processor.defaultJobs() });
 }
 
-const WorkerContext = struct {
-    files: []const []const u8,
-    input_dir: Dir,
-    output_dir: Dir,
-    key_bytes: ?[]const u8,
-    ignore_header: bool,
-    header: [HEADER_LEN]u8,
-    overwrite: bool,
-    encrypt_mode: bool,
-    mz_mode: bool,
-    gpa: std.mem.Allocator,
-    next: *std.atomic.Value(usize),
-    processed: *std.atomic.Value(usize),
-    errors: *std.atomic.Value(usize),
-};
-
-fn writeOutput(output_dir: Dir, io: std.Io, path: []const u8, data: []const u8, overwrite: bool) !void {
-    try output_dir.writeFile(io, .{ .sub_path = path, .data = data, .flags = .{ .exclusive = !overwrite } });
-}
-
-fn processOneFile(io: std.Io, gpa: std.mem.Allocator, input_dir: Dir, output_dir: Dir, entry_path: []const u8, key_bytes: ?[]const u8, ignore_header: bool, header: [HEADER_LEN]u8, overwrite: bool, encrypt_mode: bool, mz_mode: bool) !void {
-    const ext_with_dot = Dir.path.extension(entry_path);
-    if (ext_with_dot.len == 0) return;
-
-    var stack_buf: [256 * 1024]u8 = undefined;
-
-    var in_file = try input_dir.openFile(io, entry_path, .{ .mode = .read_only });
-    defer in_file.close(io);
-
-    const file_size = (try in_file.stat(io)).size;
-
-    const data: []u8 = if (file_size <= stack_buf.len)
-        stack_buf[0..file_size]
-    else
-        try gpa.alloc(u8, file_size);
-    defer if (file_size > stack_buf.len) gpa.free(data);
-
-    const n = try in_file.readPositionalAll(io, data, 0);
-    if (n == 0) return;
-
-    try processFileData(io, gpa, output_dir, entry_path, data[0..n], key_bytes, ignore_header, header, overwrite, encrypt_mode, mz_mode);
-}
-
-fn processFileData(io: std.Io, gpa: std.mem.Allocator, output_dir: Dir, entry_path: []const u8, data: []u8, key_bytes: ?[]const u8, ignore_header: bool, header: [HEADER_LEN]u8, overwrite: bool, encrypt_mode: bool, mz_mode: bool) !void {
-    var path_buf: [2048]u8 = undefined;
-
-    if (encrypt_mode) {
-        const norm_ext = extensions.NormalExt.fromString(Dir.path.extension(entry_path)[1..]) orelse return;
-        const key = key_bytes orelse return;
-
-        const dot = std.mem.lastIndexOfScalar(u8, entry_path, '.') orelse entry_path.len;
-        const out_path = try std.fmt.bufPrint(&path_buf, "{s}.{s}", .{ entry_path[0..dot], norm_ext.encryptedExt(mz_mode) });
-
-        for (0..@min(data.len, key.len)) |i| data[i] ^= key[i];
-        const out = try std.mem.concat(gpa, u8, &.{ header[0..], data });
-        defer gpa.free(out);
-        try writeOutput(output_dir, io, out_path, out, overwrite);
-        return;
-    }
-
-    const ext = Dir.path.extension(entry_path);
-    if (ext.len == 0) return;
-    const enc_ext = extensions.EncryptedExt.fromString(ext[1..]) orelse return;
-
-    if (data.len < HEADER_LEN) return error.FileTooSmall;
-
-    const dot = std.mem.lastIndexOfScalar(u8, entry_path, '.') orelse entry_path.len;
-    const out_path = try std.fmt.bufPrint(&path_buf, "{s}.{s}", .{ entry_path[0..dot], enc_ext.normalExt() });
-
-    if (key_bytes) |key| {
-        if (!ignore_header and !decrypter.verifyHeaderAgainst(data, header[0..])) return error.InvalidHeader;
-        const payload = data[HEADER_LEN..];
-        for (0..@min(payload.len, key.len)) |i| payload[i] ^= key[i];
-        try writeOutput(output_dir, io, out_path, payload, overwrite);
-    } else if (enc_ext.isPng()) {
-        const result = try D.restorePng(data, gpa);
-        defer gpa.free(result);
-        if (!ignore_header and !decrypter.verifyHeaderAgainst(data, header[0..])) return error.InvalidHeader;
-        try writeOutput(output_dir, io, out_path, result, overwrite);
-    }
-}
-
-fn workerFn(ctx: *const WorkerContext) void {
-    var threaded = std.Io.Threaded.init(ctx.gpa, .{});
-    defer threaded.deinit();
-    const worker_io = threaded.io();
-
-    while (true) {
-        const idx = ctx.next.fetchAdd(1, .monotonic);
-        if (idx >= ctx.files.len) break;
-        processOneFile(worker_io, ctx.gpa, ctx.input_dir, ctx.output_dir, ctx.files[idx], ctx.key_bytes, ctx.ignore_header, ctx.header, ctx.overwrite, ctx.encrypt_mode, ctx.mz_mode) catch {
-            _ = ctx.errors.fetchAdd(1, .monotonic);
-        };
-        _ = ctx.processed.fetchAdd(1, .monotonic);
-    }
-}
-
-pub fn main(init: std.process.Init) !void {
-    const allocator = init.arena.allocator();
+pub fn main(init: std.process.Init) !u8 {
+    const arena = init.arena.allocator();
     const io = init.io;
 
-    const args = try init.minimal.args.toSlice(allocator);
-    const cli = try parseArgs(allocator, args);
-
-    if (cli.help or cli.input_dir.len == 0) {
+    const args = try init.minimal.args.toSlice(arena);
+    const cli = parseArgs(args) catch return exit_usage;
+    if (cli.help) {
         printUsage();
-        return;
+        return 0;
     }
+    return run(io, init.gpa, arena, cli) catch |err| {
+        std.debug.print("error: {s}\n", .{processor.describeError(err)});
+        return exit_failure;
+    };
+}
 
-    if (cli.key_hex != null and !cli.key_valid) {
-        printUsage();
-        return;
-    }
-
-    if (cli.detect_key_only) {
-        const input_dir = Dir.cwd().openDir(io, cli.input_dir, .{ .iterate = true, .access_sub_paths = true }) catch |err| {
-            std.debug.print("error: could not open input directory: {s}\n", .{@errorName(err)});
-            return;
-        };
-        defer input_dir.close(io);
-        const detected = try key_detect.detectFromInput(io, allocator, input_dir);
-        if (detected) |key| {
-            defer allocator.free(key);
-            if (key_detect.validateKeyHex(key)) {
-                std.debug.print("{s}\n", .{key});
-            } else {
-                const alphabet = "0123456789abcdef";
-                for (key) |byte| {
-                    std.debug.print("{c}{c}", .{ alphabet[byte >> 4], alphabet[byte & 0x0f] });
-                }
-                std.debug.print("\n", .{});
-            }
-        } else {
-            std.debug.print("error: no encryption key found\n", .{});
-        }
-        return;
-    }
-
-    std.debug.print("rmdecrypt v{s}\n", .{VERSION});
-    std.debug.print("  input:  {s}\n", .{cli.input_dir});
-    std.debug.print("  output: {s}\n", .{cli.output_dir});
-    if (cli.encrypt_mode) std.debug.print("  mode:   encrypt\n", .{});
-
-    var key_bytes: ?[]const u8 = null;
-    defer if (key_bytes) |kb| allocator.free(kb);
-
-    if (cli.key_hex) |hex| {
-        const kb = try key_detect.hexKeyToBytes(hex, allocator);
-        std.debug.print("  key:    {s}\n", .{cli.key_hex.?});
-        key_bytes = kb;
-    } else {
-        std.debug.print("  key:    auto-detecting...\n", .{});
-        const input_dir_open = Dir.cwd().openDir(io, cli.input_dir, .{ .iterate = true, .access_sub_paths = true }) catch |err| {
-            std.debug.print("error: could not open input directory: {s}\n", .{@errorName(err)});
-            return;
-        };
-        defer input_dir_open.close(io);
-        const detected = try key_detect.detectFromInput(io, allocator, input_dir_open);
-        if (detected) |k| {
-            std.debug.print("  key:    auto-detected: {s}\n", .{k});
-            key_bytes = try key_detect.hexKeyToBytes(k, allocator);
-            allocator.free(k);
-        } else {
-            std.debug.print("  key:    not found, PNG files will be restored, audio files skipped\n", .{});
-        }
-    }
-
-    const input_dir = Dir.cwd().openDir(io, cli.input_dir, .{ .iterate = true, .access_sub_paths = true }) catch |err| {
-        std.debug.print("error: could not open input directory: {s}\n", .{@errorName(err)});
-        return;
+fn run(io: Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, cli: Cli) !u8 {
+    const input_dir = Dir.cwd().openDir(io, cli.input_dir, .{ .iterate = true }) catch |err| {
+        std.debug.print("error: cannot open input directory '{s}': {s}\n", .{ cli.input_dir, processor.describeError(err) });
+        return exit_failure;
     };
     defer input_dir.close(io);
 
-    if (cli.clean_output and std.mem.eql(u8, cli.input_dir, cli.output_dir)) {
-        std.debug.print("error: refusing to clean an output directory that is also the input directory\n", .{});
-        return;
+    if (cli.detect_key_only) {
+        const found = try key_detect.detect(io, gpa, input_dir) orelse {
+            std.debug.print("error: no encryption key found\n", .{});
+            return exit_failure;
+        };
+        var buf: [64]u8 = undefined;
+        var stdout = Io.File.stdout().writer(io, &buf);
+        try stdout.interface.print("{s}\n", .{&found.hex()});
+        try stdout.interface.flush();
+        std.debug.print("(source: {s})\n", .{found.source.describe()});
+        return 0;
     }
+
+    const output_path = cli.output_dir orelse try defaultOutputDir(arena, cli.input_dir, cli.encrypt);
+    std.debug.print("rmdecrypt v{s}\n  input:  {s}\n  output: {s}\n  mode:   {s}\n", .{
+        VERSION,                                        cli.input_dir, output_path,
+        if (!cli.encrypt) "decrypt" else if (cli.mz) "encrypt (MZ)" else "encrypt (MV)",
+    });
+
+    var key = cli.key;
+    if (key) |k| {
+        std.debug.print("  key:    {s}\n", .{&std.fmt.bytesToHex(k, .lower)});
+    } else if (try key_detect.detect(io, gpa, input_dir)) |found| {
+        key = found.key;
+        std.debug.print("  key:    {s} (auto-detected: {s})\n", .{ &found.hex(), found.source.describe() });
+    } else if (cli.encrypt) {
+        std.debug.print("error: --encrypt needs a key and none could be detected; pass --key\n", .{});
+        return exit_failure;
+    } else {
+        std.debug.print("  key:    not found - PNGs will be restored, audio files cannot be decrypted\n", .{});
+    }
+
     if (cli.clean_output) {
-        Dir.cwd().deleteTree(io, cli.output_dir) catch |err| {
-            std.debug.print("error: could not clean output directory: {s}\n", .{@errorName(err)});
-            return;
+        processor.checkCleanTarget(io, gpa, cli.input_dir, output_path) catch |err| {
+            if (err == error.OutputOverlapsInput) {
+                std.debug.print("error: refusing --clean-output: output directory overlaps the input directory\n", .{});
+            } else {
+                std.debug.print("error: cannot verify --clean-output target: {s}\n", .{processor.describeError(err)});
+            }
+            return exit_failure;
+        };
+        Dir.cwd().deleteTree(io, output_path) catch |err| {
+            std.debug.print("error: could not clean output directory: {s}\n", .{processor.describeError(err)});
+            return exit_failure;
         };
     }
-    Dir.cwd().createDirPath(io, cli.output_dir) catch |err| {
-        std.debug.print("error: could not create output directory: {s}\n", .{@errorName(err)});
-        return;
+
+    const start = Io.Clock.awake.now(io);
+    const mode: processor.Mode = if (cli.encrypt) .encrypt else .decrypt;
+    const plan = try processor.plan(io, arena, input_dir, mode);
+    if (plan.walk_errors > 0) std.debug.print("warning: {d} director{s} could not be read\n", .{ plan.walk_errors, if (plan.walk_errors == 1) "y" else "ies" });
+    if (plan.files.len == 0) {
+        std.debug.print("\nno {s} files found\n", .{if (cli.encrypt) ".png/.m4a/.ogg" else "encrypted"});
+        return exit_failure;
+    }
+
+    Dir.cwd().createDirPath(io, output_path) catch |err| {
+        std.debug.print("error: could not create output directory: {s}\n", .{processor.describeError(err)});
+        return exit_failure;
     };
-    const output_dir = Dir.cwd().openDir(io, cli.output_dir, .{}) catch |err| {
-        std.debug.print("error: could not open output directory: {s}\n", .{@errorName(err)});
-        return;
+    const output_dir = Dir.cwd().openDir(io, output_path, .{}) catch |err| {
+        std.debug.print("error: could not open output directory: {s}\n", .{processor.describeError(err)});
+        return exit_failure;
     };
     defer output_dir.close(io);
+    processor.createOutputDirs(io, output_dir, plan);
 
-    // Phase 1: collect all encrypted file paths
-    var file_list: std.ArrayList([]const u8) = .empty;
-    {
-        var walker = input_dir.walk(allocator) catch |err| {
-            std.debug.print("error: could not walk input directory: {s}\n", .{@errorName(err)});
-            return;
-        };
-        defer walker.deinit();
-        while (true) {
-            const entry = walker.next(io) catch continue orelse break;
-            if (entry.kind != .file) continue;
-            const ext_dot = Dir.path.extension(entry.basename);
-            if (ext_dot.len == 0) continue;
-            if (cli.encrypt_mode) {
-                if (extensions.NormalExt.fromString(ext_dot[1..]) == null) continue;
-            } else if (extensions.EncryptedExt.fromString(ext_dot[1..]) == null) continue;
-            try file_list.append(allocator, try allocator.dupe(u8, entry.path));
-        }
-    }
-
-    // Phase 2: pre-create unique output directories
-    {
-        var created = std.StringHashMap(void).init(allocator);
-        defer created.deinit();
-        for (file_list.items) |path| {
-            const ext_dot = Dir.path.extension(path);
-            if (ext_dot.len == 0) continue;
-            const output_extension = if (cli.encrypt_mode) blk: {
-                const norm = extensions.NormalExt.fromString(ext_dot[1..]) orelse continue;
-                break :blk norm.encryptedExt(cli.mz_mode);
-            } else blk: {
-                const enc = extensions.EncryptedExt.fromString(ext_dot[1..]) orelse continue;
-                break :blk enc.normalExt();
-            };
-            const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse continue;
-            var buf: [2048]u8 = undefined;
-            const out = std.fmt.bufPrint(&buf, "{s}.{s}", .{ path[0..dot], output_extension }) catch continue;
-            const dir = Dir.path.dirname(out);
-            if (dir) |d| {
-                if (d.len > 0) {
-                    const gop = created.getOrPut(d) catch continue;
-                    if (!gop.found_existing) {
-                        // `d` points into the stack `buf` above, which is
-                        // overwritten every iteration — the map must own
-                        // its key copies (arena; freed in bulk at exit).
-                        gop.key_ptr.* = allocator.dupe(u8, d) catch continue;
-                        output_dir.createDirPath(io, d) catch {};
-                    }
-                }
-            }
-        }
-    }
-
-    // Phase 3: parallel processing
-    const n_cpus = try std.Thread.getCpuCount();
-    const n_workers = @min(n_cpus, 6);
-
-    var next = std.atomic.Value(usize).init(0);
-    var processed = std.atomic.Value(usize).init(0);
-    var errors = std.atomic.Value(usize).init(0);
-
-    const ctx = WorkerContext{
-        .files = file_list.items,
-        .input_dir = input_dir,
-        .output_dir = output_dir,
-        .key_bytes = key_bytes,
-        .ignore_header = cli.ignore_header,
+    var job = try processor.Job.init(io, gpa, input_dir, output_dir, plan.files, .{
+        .mode = mode,
+        .mz = cli.mz,
+        .key = key,
         .header = cli.header,
+        .verify_header = !cli.ignore_header,
         .overwrite = cli.overwrite,
-        .encrypt_mode = cli.encrypt_mode,
-        .mz_mode = cli.mz_mode,
-        .gpa = init.gpa,
-        .next = &next,
-        .processed = &processed,
-        .errors = &errors,
-    };
+    });
+    defer job.deinit();
+    job.start(cli.jobs orelse processor.defaultJobs());
+    job.join();
+    const elapsed_ms = @as(f64, @floatFromInt(start.durationTo(Io.Clock.awake.now(io)).toNanoseconds())) / 1e6;
 
-    var threads: [8]std.Thread = undefined;
-    var thread_count: usize = 0;
-    for (0..n_workers) |_| {
-        threads[thread_count] = try std.Thread.spawn(.{}, workerFn, .{&ctx});
-        thread_count += 1;
+    var failed: usize = 0;
+    for (plan.files, 0..) |path, i| {
+        job.result(i).? catch |err| {
+            failed += 1;
+            if (failed <= max_reported_failures) std.debug.print("  x {s}: {s}\n", .{ path, processor.describeError(err) });
+        };
     }
-    for (0..thread_count) |i| {
-        threads[i].join();
-    }
+    if (failed > max_reported_failures) std.debug.print("  ... and {d} more\n", .{failed - max_reported_failures});
 
-    const p = processed.load(.monotonic);
-    const e = errors.load(.monotonic);
-    if (e > 0) {
-        std.debug.print("\n{d} files processed, {d} errors\n", .{ p, e });
-    } else {
-        std.debug.print("\n{d} files processed successfully\n", .{p});
+    const ok = plan.files.len - failed;
+    if (failed > 0) {
+        std.debug.print("\n{d} files processed, {d} failed ({d:.0} ms)\n", .{ ok, failed, elapsed_ms });
+        return exit_failure;
     }
+    std.debug.print("\n{d} files processed successfully ({d:.0} ms)\n", .{ ok, elapsed_ms });
+    return 0;
+}
+
+test {
+    _ = decrypter;
+    _ = key_detect;
+    _ = processor;
+    _ = @import("extensions.zig");
 }

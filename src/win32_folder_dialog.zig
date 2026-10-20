@@ -14,8 +14,8 @@
 //!      dialog's COM class is genuinely missing (stripped Windows
 //!      installs and Windows Server Core variants).
 //!
-//!   3. **Returns null** so the caller can fall back to
-//!      `dvui.dialogNativeFolderSelect` (tinyfiledialogs).
+//!   3. **Returns null** so the caller can tell the user to type or
+//!      drag-and-drop the path instead.
 //!
 //! Returns `null` on cancel or when no strategy succeeds.
 
@@ -136,7 +136,7 @@ const win = struct {
         Release: *const fn (*anyopaque) callconv(.winapi) u32,
         _p1: *const fn (...) callconv(.winapi) HRESULT,
         _p2: *const fn (...) callconv(.winapi) HRESULT,
-        GetDisplayName: *const fn (*anyopaque, u32, *LPWSTR) callconv(.winapi) HRESULT,
+        GetDisplayName: *const fn (*anyopaque, u32, *?[*:0]u16) callconv(.winapi) HRESULT,
     };
 
     extern "ole32" fn CoInitializeEx(pvReserved: ?*anyopaque, dwCoInit: u32) callconv(.winapi) HRESULT;
@@ -178,7 +178,9 @@ fn selectFolderModern(alloc: std.mem.Allocator, title: ?[]const u8) !?[]u8 {
         return null;
     }
     const dialog = dialog_opt.?;
-    errdefer releaseCom(dialog);
+    // Sole owner of the dialog reference: every exit path below — including
+    // `error.Canceled` and allocation failures — releases it exactly once.
+    defer releaseCom(dialog);
 
     const vt_ptr: *usize = @ptrCast(@alignCast(dialog));
     const vt: *win.VTable = @ptrFromInt(vt_ptr.*);
@@ -188,41 +190,35 @@ fn selectFolderModern(alloc: std.mem.Allocator, title: ?[]const u8) !?[]u8 {
     _ = vt.SetOptions(dialog, options | win.FOS_PICKFOLDERS | win.FOS_NOCHANGEDIR);
 
     if (title) |t| {
-        const wide_title = try std.unicode.utf8ToUtf16LeAlloc(alloc, t);
+        const wide_title = try std.unicode.utf8ToUtf16LeAllocZ(alloc, t);
         defer alloc.free(wide_title);
-        _ = vt.SetTitle(dialog, @ptrCast(wide_title.ptr));
+        _ = vt.SetTitle(dialog, wide_title.ptr);
     }
 
     const hr_show = vt.Show(dialog, null);
-    if (hr_show == win.ERROR_CANCELLED_HR) {
-        releaseCom(dialog);
-        return error.Canceled;
-    }
+    if (hr_show == win.ERROR_CANCELLED_HR) return error.Canceled;
     if (hr_show != win.S_OK) {
         if (builtin.mode == .Debug) {
             std.debug.print("[folder_picker] Show failed: 0x{x:0>8}\n", .{hr_show});
         }
-        releaseCom(dialog);
         return null;
     }
 
     var item_opt: ?*anyopaque = null;
     const hr_get = vt.GetResult(dialog, &item_opt);
-    releaseCom(dialog);
     if (hr_get != win.S_OK or item_opt == null) return null;
     const item = item_opt.?;
+    defer releaseCom(item);
 
     const item_vt_ptr: *usize = @ptrCast(@alignCast(item));
     const item_vt: *win.IShellItemVTable = @ptrFromInt(item_vt_ptr.*);
 
-    var wide_path_ptr: [*]u16 = undefined;
-    const hr_name = item_vt.GetDisplayName(item, win.SIGDN_FILESYSPATH, &wide_path_ptr);
-    releaseCom(item);
-    if (hr_name != win.S_OK) return null;
-    defer win.CoTaskMemFree(@ptrCast(wide_path_ptr));
+    var wide_path: ?[*:0]u16 = null;
+    if (item_vt.GetDisplayName(item, win.SIGDN_FILESYSPATH, &wide_path) != win.S_OK) return null;
+    const path = wide_path orelse return null;
+    defer win.CoTaskMemFree(@ptrCast(path));
 
-    const wide_slice = std.mem.sliceTo(wide_path_ptr, 0);
-    return try std.unicode.utf16LeToUtf8Alloc(alloc, wide_slice);
+    return try std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.sliceTo(path, 0));
 }
 
 fn releaseCom(obj: *anyopaque) void {
@@ -266,7 +262,7 @@ const sh = struct {
     const ITEMIDLIST = opaque {}; // pidl (unused on input; SHBrowseForFolder returns one)
 
     // user32 — get the foreground window so the dialog has a parent
-    // (the active SDL window). With NULL hwndOwner the dialog either
+    // (the app's main window). With NULL hwndOwner the dialog either
     // appears off-screen or is dismissed immediately on some setups.
     extern "user32" fn GetForegroundWindow() callconv(.winapi) ?HWND;
     extern "user32" fn SendMessageW(hWnd: HWND, Msg: u32, wParam: usize, lParam: isize) callconv(.winapi) isize;

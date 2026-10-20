@@ -5547,6 +5547,9 @@ struct nk_style_window_header {
 struct nk_style_window {
     struct nk_style_window_header header;
     struct nk_style_item fixed_background;
+    /* rmdecrypt patch: background of group panels (cards). Defaults to the
+     * window color, so stock behavior is unchanged. */
+    struct nk_style_item group_background;
     struct nk_color background;
 
     struct nk_color border_color;
@@ -7982,9 +7985,9 @@ nk_rgb_factor(struct nk_color col, float factor)
 {
     if (factor == 1.0f)
         return col;
-    col.r = (nk_byte)(col.r * factor);
-    col.g = (nk_byte)(col.g * factor);
-    col.b = (nk_byte)(col.b * factor);
+    /* rmdecrypt patch: fade (alpha) instead of darkening RGB, so disabled
+     * widgets recede into the background on light themes too. */
+    col.a = (nk_byte)(col.a * factor);
     return col;
 }
 NK_API struct nk_color
@@ -19338,6 +19341,7 @@ nk_style_from_table(struct nk_context *ctx, const struct nk_color *table)
     /* window */
     win->background = table[NK_COLOR_WINDOW];
     win->fixed_background = nk_style_item_color(table[NK_COLOR_WINDOW]);
+    win->group_background = nk_style_item_color(table[NK_COLOR_WINDOW]);
     win->border_color = table[NK_COLOR_BORDER];
     win->popup_border_color = table[NK_COLOR_BORDER];
     win->combo_border_color = table[NK_COLOR_BORDER];
@@ -20386,15 +20390,18 @@ nk_panel_begin(struct nk_context *ctx, const char *title, enum nk_panel_type pan
         body.y = (win->bounds.y + layout->header_height);
         body.h = (win->bounds.h - layout->header_height);
 
-        switch(style->window.fixed_background.type) {
+        /* rmdecrypt patch: groups use their own background (cards) */
+        const struct nk_style_item *bg = (layout->type == NK_PANEL_GROUP)
+            ? &style->window.group_background : &style->window.fixed_background;
+        switch(bg->type) {
             case NK_STYLE_ITEM_IMAGE:
-                nk_draw_image(out, body, &style->window.fixed_background.data.image, nk_white);
+                nk_draw_image(out, body, &bg->data.image, nk_white);
                 break;
             case NK_STYLE_ITEM_NINE_SLICE:
-                nk_draw_nine_slice(out, body, &style->window.fixed_background.data.slice, nk_white);
+                nk_draw_nine_slice(out, body, &bg->data.slice, nk_white);
                 break;
             case NK_STYLE_ITEM_COLOR:
-                nk_fill_rect(out, body, style->window.rounding, style->window.fixed_background.data.color);
+                nk_fill_rect(out, body, style->window.rounding, bg->data.color);
                 break;
         }
     }
@@ -26872,8 +26879,6 @@ nk_do_scrollbarv(nk_flags *state,
 
     float scroll_step;
     float scroll_offset;
-    float scroll_off;
-    float scroll_ratio;
 
     NK_ASSERT(out);
     NK_ASSERT(style);
@@ -26913,34 +26918,80 @@ nk_do_scrollbarv(nk_flags *state,
         scroll.h = scroll_h;
     }
 
-    /* calculate scrollbar constants */
-    scroll_step = NK_MIN(step, scroll.h);
-    scroll_offset = NK_CLAMP(0, offset, target - scroll.h);
-    scroll_ratio = scroll.h / target;
-    scroll_off = scroll_offset / target;
+    /* rmdecrypt patch: one self-consistent geometry for drawing, hovering,
+     * pressing and dragging the thumb. Stock Nuklear hit-tests the whole
+     * track for hover, sizes the thumb as track * ratio (a 2000-line log gets
+     * a ~2 px thumb) and, while dragging, re-centres the press point on the
+     * stock thumb position — so any thumb adjustment loses the drag. Here the
+     * thumb has a minimum length, only the thumb itself highlights, and a
+     * drag maps mouse travel 1:1 onto thumb travel. */
+    {
+        const float inset = style->border_cursor + style->padding.y;
+        const float track_y = scroll.y + inset;
+        const float track_h = NK_MAX(scroll.h - 2.0f * inset, 1.0f);
+        const float max_off = target - scroll.h;
+        const float min_h = NK_MIN(NK_MAX(scroll.w * 4.0f, 24.0f), track_h);
+        const float thumb_h = NK_CLAMP(min_h, track_h * (scroll.h / target), track_h);
+        const float travel = track_h - thumb_h;
+        int left_down, pressed_in_thumb;
 
-    /* calculate scrollbar cursor bounds */
-    cursor.h = NK_MAX((scroll_ratio * scroll.h) - (2*style->border + 2*style->padding.y), 0);
-    cursor.y = scroll.y + (scroll_off * scroll.h) + style->border + style->padding.y;
-    cursor.w = scroll.w - (2 * style->border + 2 * style->padding.x);
-    cursor.x = scroll.x + style->border + style->padding.x;
+        scroll_step = NK_MIN(step, scroll.h);
+        scroll_offset = NK_CLAMP(0, offset, max_off);
 
-    /* calculate empty space around cursor */
-    empty_north.x = scroll.x;
-    empty_north.y = scroll.y;
-    empty_north.w = scroll.w;
-    empty_north.h = NK_MAX(cursor.y - scroll.y, 0);
+        cursor.h = thumb_h;
+        cursor.w = scroll.w - (2 * style->border + 2 * style->padding.x);
+        cursor.x = scroll.x + style->border + style->padding.x;
+        cursor.y = track_y + (max_off > 0 ? scroll_offset / max_off : 0) * travel;
 
-    empty_south.x = scroll.x;
-    empty_south.y = cursor.y + cursor.h;
-    empty_south.w = scroll.w;
-    empty_south.h = NK_MAX((scroll.y + scroll.h) - (cursor.y + cursor.h), 0);
+        empty_north = nk_rect(scroll.x, scroll.y, scroll.w, NK_MAX(cursor.y - scroll.y, 0));
+        empty_south = nk_rect(scroll.x, cursor.y + cursor.h, scroll.w,
+            NK_MAX((scroll.y + scroll.h) - (cursor.y + cursor.h), 0));
 
-    /* update scrollbar */
-    scroll_offset = nk_scrollbar_behavior(state, in, has_scrolling, &scroll, &cursor,
-        &empty_north, &empty_south, scroll_offset, target, scroll_step, NK_VERTICAL);
-    scroll_off = scroll_offset / target;
-    cursor.y = scroll.y + (scroll_off * scroll.h) + style->border_cursor + style->padding.y;
+        nk_widget_state_reset(state);
+        if (in) {
+            left_down = in->mouse.buttons[NK_BUTTON_LEFT].down;
+            pressed_in_thumb = nk_input_has_mouse_click_down_in_rect(in,
+                NK_BUTTON_LEFT, cursor, nk_true);
+            if (nk_input_is_mouse_hovering_rect(in, cursor))
+                *state = NK_WIDGET_STATE_HOVERED;
+
+            if (left_down && pressed_in_thumb && !in->mouse.buttons[NK_BUTTON_LEFT].clicked) {
+                /* drag: the thumb follows the mouse exactly */
+                *state = NK_WIDGET_STATE_ACTIVE;
+                if (travel > 0)
+                    scroll_offset = NK_CLAMP(0, scroll_offset +
+                        in->mouse.delta.y * (max_off / travel), max_off);
+                {
+                    const float new_y = track_y + (max_off > 0 ? scroll_offset / max_off : 0) * travel;
+                    /* keep the press point on the thumb so the drag holds
+                     * even when the mouse overshoots an end of the track */
+                    in->mouse.buttons[NK_BUTTON_LEFT].clicked_pos.y = new_y + thumb_h * 0.5f;
+                    in->mouse.buttons[NK_BUTTON_LEFT].clicked_pos.x = cursor.x + cursor.w * 0.5f;
+                }
+            } else if (nk_input_is_mouse_click_in_rect(in, NK_BUTTON_LEFT, empty_north)
+                    || (has_scrolling && nk_input_is_key_pressed(in, NK_KEY_SCROLL_UP))) {
+                scroll_offset = NK_MAX(0, scroll_offset - scroll.h);   /* page up */
+            } else if (nk_input_is_mouse_click_in_rect(in, NK_BUTTON_LEFT, empty_south)
+                    || (has_scrolling && nk_input_is_key_pressed(in, NK_KEY_SCROLL_DOWN))) {
+                scroll_offset = NK_MIN(scroll_offset + scroll.h, max_off); /* page down */
+            } else if (has_scrolling) {
+                /* wheel: at least three text lines per notch (stock is 10%
+                 * of the view, often less than a single line) */
+                const float wheel_step = font ? NK_MAX(scroll_step, 3.0f * font->height) : scroll_step;
+                if (in->mouse.scroll_delta.y != 0)
+                    scroll_offset = NK_CLAMP(0, scroll_offset - wheel_step * in->mouse.scroll_delta.y, max_off);
+                else if (nk_input_is_key_pressed(in, NK_KEY_SCROLL_START))
+                    scroll_offset = 0;
+                else if (nk_input_is_key_pressed(in, NK_KEY_SCROLL_END))
+                    scroll_offset = max_off;
+            }
+            if ((*state & NK_WIDGET_STATE_HOVER) && !nk_input_is_mouse_prev_hovering_rect(in, cursor))
+                *state |= NK_WIDGET_STATE_ENTERED;
+            else if (nk_input_is_mouse_prev_hovering_rect(in, cursor))
+                *state |= NK_WIDGET_STATE_LEFT;
+        }
+        cursor.y = track_y + (max_off > 0 ? scroll_offset / max_off : 0) * travel;
+    }
 
     /* draw scrollbar */
     if (style->draw_begin) style->draw_begin(out, style->userdata);

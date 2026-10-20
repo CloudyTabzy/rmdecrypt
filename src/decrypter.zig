@@ -1,6 +1,16 @@
+//! RPG Maker MV/MZ asset "encryption" primitives.
+//!
+//! The scheme is a 16-byte fake header followed by the original file whose
+//! first 16 bytes are XORed with a 16-byte key. Everything here works in
+//! place on caller-owned buffers; nothing allocates.
+
 const std = @import("std");
 
-pub const DEFAULT_HEADER: [16]u8 = .{
+pub const header_len = 16;
+pub const Key = [header_len]u8;
+pub const Header = [header_len]u8;
+
+pub const DEFAULT_HEADER: Header = .{
     0x52, 0x50, 0x47, 0x4D, 0x56, 0x00, 0x00, 0x00,
     0x00, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
@@ -11,149 +21,76 @@ pub const PNG_HEADER: [16]u8 = .{
 };
 
 /// Checks a fake RPG Maker header against a caller-supplied expected value.
-/// This keeps compatibility handling explicit while retaining the standard
-/// header as the default.
-pub fn verifyHeaderAgainst(data: []const u8, expected: []const u8) bool {
-    return data.len >= expected.len and std.mem.eql(u8, data[0..expected.len], expected);
+pub fn verifyHeader(data: []const u8, expected: *const Header) bool {
+    return data.len >= header_len and std.mem.eql(u8, data[0..header_len], expected);
 }
 
-pub fn Decrypter(comptime header_len: comptime_int) type {
-    return struct {
-        const Self = @This();
-
-        pub const header_len_bytes = header_len;
-
-        pub fn verifyHeader(data: []const u8) bool {
-            if (data.len < header_len) return false;
-            for (data[0..header_len], 0..) |byte, i| {
-                if (byte != DEFAULT_HEADER[i]) return false;
-            }
-            return true;
-        }
-
-        pub fn xorBytes(data: []u8, key: []const u8) void {
-            const len = @min(data.len, header_len);
-            for (0..len) |i| {
-                data[i] ^= key[i % key.len];
-            }
-        }
-
-        pub fn decrypt(data: []const u8, key: []const u8, allocator: std.mem.Allocator) ![]u8 {
-            if (data.len < header_len) return error.FileTooSmall;
-            const result = try allocator.dupe(u8, data[header_len..]);
-            xorBytes(result, key);
-            return result;
-        }
-
-        pub fn encrypt(data: []const u8, key: []const u8, allocator: std.mem.Allocator) ![]u8 {
-            const result = try allocator.dupe(u8, data);
-            xorBytes(result, key);
-            const out = try allocator.alloc(u8, header_len + result.len);
-            @memcpy(out[0..header_len], &DEFAULT_HEADER);
-            @memcpy(out[header_len..], result);
-            allocator.free(result);
-            return out;
-        }
-
-        pub fn restorePng(data: []const u8, allocator: std.mem.Allocator) ![]u8 {
-            const skip = header_len * 2;
-            if (data.len < skip) return error.FileTooSmall;
-            var result = try allocator.alloc(u8, PNG_HEADER.len + (data.len - skip));
-            @memcpy(result[0..PNG_HEADER.len], &PNG_HEADER);
-            @memcpy(result[PNG_HEADER.len..], data[skip..]);
-            return result;
-        }
-
-        pub fn deriveKeyFromPng(data: []const u8, allocator: std.mem.Allocator) ![]u8 {
-            if (data.len < header_len * 2) return error.FileTooSmall;
-            var key = try allocator.alloc(u8, header_len);
-            const encrypted_bytes = data[header_len..][0..header_len];
-            for (0..header_len) |i| {
-                key[i] = PNG_HEADER[i] ^ encrypted_bytes[i];
-            }
-            return key;
-        }
-    };
+/// XORs the first `min(data.len, 16)` bytes of `data` with `key`. The
+/// operation is its own inverse, so it both encrypts and decrypts.
+pub fn xorKey(data: []u8, key: *const Key) void {
+    if (data.len >= header_len) {
+        const V = @Vector(header_len, u8);
+        const block: V = data[0..header_len].*;
+        data[0..header_len].* = block ^ @as(V, key.*);
+    } else {
+        for (data, key[0..data.len]) |*b, k| b.* ^= k;
+    }
 }
 
-pub const DefaultDecrypter = Decrypter(16);
+/// Recovers the key from the first 32 bytes of an encrypted PNG: the
+/// payload must start with the fixed 16-byte PNG signature + IHDR tag.
+pub fn deriveKeyFromPng(data: []const u8) ?Key {
+    if (data.len < header_len * 2) return null;
+    const V = @Vector(header_len, u8);
+    const encrypted: V = data[header_len..][0..header_len].*;
+    return encrypted ^ @as(V, PNG_HEADER);
+}
 
-comptime {
-    std.testing.refAllDecls(@This());
-    std.testing.refAllDecls(DefaultDecrypter);
+/// Parses a 32-character hex string into a key or header.
+pub fn parseHex16(hex: []const u8) ?[16]u8 {
+    if (hex.len != 32) return null;
+    var out: [16]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, hex) catch return null;
+    return out;
 }
 
 test "header verification" {
-    const D = DefaultDecrypter;
-    try std.testing.expect(D.verifyHeader(&DEFAULT_HEADER));
-    try std.testing.expect(!D.verifyHeader(&[_]u8{0} ** 16));
+    try std.testing.expect(verifyHeader(&DEFAULT_HEADER, &DEFAULT_HEADER));
+    try std.testing.expect(!verifyHeader(&([_]u8{0} ** 16), &DEFAULT_HEADER));
+    const custom: Header = @splat(0xA5);
+    try std.testing.expect(verifyHeader(&custom, &custom));
+    try std.testing.expect(!verifyHeader(custom[0..15], &custom));
 }
 
-test "custom header verification" {
-    const custom = [_]u8{0xA5} ** 16;
-    try std.testing.expect(verifyHeaderAgainst(&custom, &custom));
-    try std.testing.expect(!verifyHeaderAgainst(&DEFAULT_HEADER, &custom));
-    try std.testing.expect(!verifyHeaderAgainst(custom[0..15], &custom));
-}
+test "xor roundtrip, long and short buffers" {
+    var key: Key = undefined;
+    for (&key, 0..) |*k, i| k.* = @intCast(i * 7 + 1);
+    const original = [_]u8{0xAA} ** 40;
 
-test "decrypt roundtrip" {
-    const alloc = std.testing.allocator;
-    const D = DefaultDecrypter;
+    var long = original;
+    xorKey(&long, &key);
+    try std.testing.expect(!std.mem.eql(u8, &long, &original));
+    try std.testing.expectEqualSlices(u8, original[16..], long[16..]); // tail untouched
+    xorKey(&long, &key);
+    try std.testing.expectEqualSlices(u8, &original, &long);
 
-    var key_bytes = try alloc.alloc(u8, 16);
-    defer alloc.free(key_bytes);
-    for (0..16) |i| key_bytes[i] = @intCast(i);
-
-    const plaintext = [_]u8{0xAA} ** 32;
-
-    const encrypted = try D.encrypt(&plaintext, key_bytes, alloc);
-    defer alloc.free(encrypted);
-
-    try std.testing.expect(D.verifyHeader(encrypted[0..16]));
-
-    const decrypted = try D.decrypt(encrypted, key_bytes, alloc);
-    defer alloc.free(decrypted);
-
-    try std.testing.expectEqualSlices(u8, &plaintext, decrypted);
-}
-
-test "restore png" {
-    const alloc = std.testing.allocator;
-    const D = DefaultDecrypter;
-
-    const fake_header = DEFAULT_HEADER;
-    var enc_header: [16]u8 = undefined;
-    for (0..16) |i| enc_header[i] = PNG_HEADER[i] ^ @as(u8, @intCast(i));
-
-    var file_data = try alloc.alloc(u8, 16 + 16 + 8);
-    defer alloc.free(file_data);
-    @memcpy(file_data[0..16], &fake_header);
-    @memcpy(file_data[16..32], &enc_header);
-    @memcpy(file_data[32..], &[_]u8{0xBB} ** 8);
-
-    const restored = try D.restorePng(file_data, alloc);
-    defer alloc.free(restored);
-
-    try std.testing.expectEqualSlices(u8, &PNG_HEADER, restored[0..16]);
-    try std.testing.expectEqualSlices(u8, &[_]u8{0xBB} ** 8, restored[16..]);
+    var short = [_]u8{ 1, 2, 3 };
+    xorKey(&short, &key);
+    try std.testing.expectEqualSlices(u8, &.{ 1 ^ 1, 2 ^ 8, 3 ^ 15 }, &short);
 }
 
 test "derive key from png" {
-    const alloc = std.testing.allocator;
-    const D = DefaultDecrypter;
+    var file: [40]u8 = undefined;
+    @memcpy(file[0..16], &DEFAULT_HEADER);
+    for (file[16..32], 0..) |*b, i| b.* = PNG_HEADER[i] ^ @as(u8, @intCast(i));
+    const key = deriveKeyFromPng(&file).?;
+    for (key, 0..) |k, i| try std.testing.expectEqual(@as(u8, @intCast(i)), k);
+    try std.testing.expect(deriveKeyFromPng(file[0..31]) == null);
+}
 
-    var encrypted_bytes: [16]u8 = undefined;
-    for (0..16) |i| encrypted_bytes[i] = PNG_HEADER[i] ^ @as(u8, @intCast(i));
-
-    var file_data = try alloc.alloc(u8, 16 + 16);
-    defer alloc.free(file_data);
-    @memcpy(file_data[0..16], &DEFAULT_HEADER);
-    @memcpy(file_data[16..], &encrypted_bytes);
-
-    const derived = try D.deriveKeyFromPng(file_data, alloc);
-    defer alloc.free(derived);
-
-    for (0..16) |i| {
-        try std.testing.expectEqual(@as(u8, @intCast(i)), derived[i]);
-    }
+test "parse hex16" {
+    const k = parseHex16("000102030405060708090a0B0c0D0e0F").?;
+    for (k, 0..) |b, i| try std.testing.expectEqual(@as(u8, @intCast(i)), b);
+    try std.testing.expect(parseHex16("0001") == null);
+    try std.testing.expect(parseHex16("zz0102030405060708090a0b0c0d0e0f") == null);
 }

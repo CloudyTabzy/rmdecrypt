@@ -31,11 +31,14 @@
 typedef void (*nkshim_drop_cb)(const char *utf8_path, void *ud);
 extern struct nk_context *nkshim_init(int width, int height, const char *title);
 extern void nkshim_set_drop_callback(nkshim_drop_cb cb, void *ud);
+typedef void (*nkshim_frame_cb)(void *ud);
+extern void nkshim_set_frame_callback(nkshim_frame_cb cb, void *ud);
 extern int  nkshim_pump_events(void);
 extern void nkshim_render(void);
 extern void nkshim_get_client_size(int *w, int *h);
 extern void nkshim_set_bg(int r, int g, int b);
 extern void nkshim_shutdown(void);
+extern float nkshim_dpi_scale(void);
 
 enum nkshim_font_id {
     NKSHIM_FONT_UI = 0,
@@ -64,10 +67,9 @@ extern void rmd_zig_log_clear(void);
 
 /* ── UI state ─────────────────────────────────────────────────────────── */
 
-#define VERSION  "1.0.0"
+#define VERSION  "1.2.0"
 #define BUF_LEN  1024
 #define BATCH    15
-#define ROW_GAP  10.0f   /* must match ctx->style.window.spacing.y */
 
 enum app_status { ST_IDLE, ST_PROCESSING, ST_DONE };
 
@@ -136,112 +138,161 @@ ico(unsigned cp)
     return buf;
 }
 
+/* ── layout metrics (96-DPI pixels; S() applies the DPI scale) ────────── */
+
+static float g_scale = 1.0f;
+#define S(px) ((float)(px) * g_scale)
+
+#define GAP        10   /* widget spacing, x and y */
+#define PAD_X      18   /* main window padding */
+#define PAD_Y      14
+#define CARD_PAD_X 14   /* inside cards */
+#define CARD_PAD_Y 12
+#define ROW_H      30   /* fields and buttons */
+#define TITLE_H    24   /* card titles */
+#define LINE_H     20   /* status and caption lines */
+#define CHECK_H    26   /* checkbox / radio rows */
+#define LABEL_W    96   /* left label column, shared by every card */
+#define BTN_W     124
+#define ICON_W     24
+#define HEADER_H   36   /* title row; also the theme toggle's side */
+#define START_H    40
+#define BAR_H      10
+#define LOG_MIN_H 150
+#define LOG_GAP     2   /* tighter line spacing inside the log */
+#define DETECT_W   84   /* compact "Detect" button in the key row */
+#define RESET_W    64
+
+/* Height of a card holding rows whose heights sum to `rows_h`. */
+static float
+card_h(float rows_h, int rows)
+{
+    return rows_h + S(GAP) * (float)(rows - 1) + 2.0f * S(CARD_PAD_Y) + 2.0f;
+}
+
 /* ── theme ────────────────────────────────────────────────────────────── */
 
 static struct nk_color accent, ok_col, warn_col, err_col, dim_col,
-                       heading_col, log_col,
+                       heading_col, log_col, card_col,
                        btn_normal, btn_hover, btn_active;
 
 static void
 apply_style_tweaks(struct nk_context *ctx, struct nk_color border_col)
 {
-    ctx->style.window.spacing = nk_vec2(10.0f, ROW_GAP);
-    ctx->style.window.padding = nk_vec2(18.0f, 16.0f);
-    ctx->style.window.scrollbar_size = nk_vec2(10.0f, 10.0f);
-    ctx->style.button.rounding = 5.0f;
-    ctx->style.button.border = 1.0f;
-    ctx->style.button.border_color = border_col;
-    ctx->style.edit.rounding = 5.0f;
-    ctx->style.edit.border = 1.0f;
-    ctx->style.edit.border_color = border_col;
-    ctx->style.progress.rounding = 5.0f;
-    ctx->style.progress.cursor_rounding = 5.0f;
+    struct nk_style *st = &ctx->style;
+    st->window.spacing = nk_vec2(S(GAP), S(GAP));
+    st->window.padding = nk_vec2(S(PAD_X), S(PAD_Y));
+    st->window.group_padding = nk_vec2(S(CARD_PAD_X), S(CARD_PAD_Y));
+    st->window.rounding = S(8);
+    st->window.group_border = 1.0f;
+    st->window.group_border_color = border_col;
+    st->window.group_background = nk_style_item_color(card_col); /* vendored patch */
+    st->window.scrollbar_size = nk_vec2(S(8), S(8));
+
+    st->button.rounding = S(6);
+    st->button.border = 1.0f;
+    st->button.border_color = border_col;
+    st->edit.rounding = S(6);
+    st->edit.border = 1.0f;
+    st->edit.border_color = border_col;
+    st->edit.padding = nk_vec2(S(8), S(4));
+    st->progress.rounding = S(5);
+    st->progress.cursor_rounding = S(5);
+    st->progress.padding = nk_vec2(0, 0);
+    st->progress.border = 0;
+    st->scrollv.rounding = S(4);
+    st->scrollv.rounding_cursor = S(4);
+    st->checkbox.spacing = S(8);
+    st->option.spacing = S(8);
 }
 
 /* Tokyo Night palettes: https://github.com/folke/tokyonight.nvim
- * (night + day variants). */
+ * (night + day variants). Window < card < field, so cards read as raised
+ * panels and inputs as inset wells. */
 static void
 set_theme(struct nk_context *ctx, int dark)
 {
     struct nk_color table[NK_COLOR_COUNT];
     if (dark) {
         table[NK_COLOR_TEXT] = nk_rgb(0xc0, 0xca, 0xf5);
-        table[NK_COLOR_WINDOW] = nk_rgb(0x1a, 0x1b, 0x26);
+        table[NK_COLOR_WINDOW] = nk_rgb(0x16, 0x16, 0x1e);
         table[NK_COLOR_HEADER] = nk_rgb(0x16, 0x16, 0x1e);
-        table[NK_COLOR_BORDER] = nk_rgb(0x29, 0x2e, 0x42);
-        table[NK_COLOR_BUTTON] = nk_rgb(0x2f, 0x35, 0x4d);
-        table[NK_COLOR_BUTTON_HOVER] = nk_rgb(0x3d, 0x59, 0xa1);
-        table[NK_COLOR_BUTTON_ACTIVE] = nk_rgb(0x7a, 0xa2, 0xf7);
-        table[NK_COLOR_TOGGLE] = nk_rgb(0x29, 0x2e, 0x42);
-        table[NK_COLOR_TOGGLE_HOVER] = nk_rgb(0x33, 0x46, 0x7c);
+        table[NK_COLOR_BORDER] = nk_rgb(0x2b, 0x30, 0x49);
+        table[NK_COLOR_BUTTON] = nk_rgb(0x29, 0x2e, 0x42);
+        table[NK_COLOR_BUTTON_HOVER] = nk_rgb(0x34, 0x3b, 0x58);
+        table[NK_COLOR_BUTTON_ACTIVE] = nk_rgb(0x3d, 0x59, 0xa1);
+        table[NK_COLOR_TOGGLE] = nk_rgb(0x2b, 0x30, 0x49);
+        table[NK_COLOR_TOGGLE_HOVER] = nk_rgb(0x3b, 0x42, 0x61);
         table[NK_COLOR_TOGGLE_CURSOR] = nk_rgb(0x7a, 0xa2, 0xf7);
-        table[NK_COLOR_SELECT] = nk_rgb(0x29, 0x2e, 0x42);
+        table[NK_COLOR_SELECT] = nk_rgb(0x2b, 0x30, 0x49);
         table[NK_COLOR_SELECT_ACTIVE] = nk_rgb(0x7a, 0xa2, 0xf7);
-        table[NK_COLOR_SLIDER] = nk_rgb(0x29, 0x2e, 0x42);
+        table[NK_COLOR_SLIDER] = nk_rgb(0x2b, 0x30, 0x49);
         table[NK_COLOR_SLIDER_CURSOR] = nk_rgb(0x7a, 0xa2, 0xf7);
         table[NK_COLOR_SLIDER_CURSOR_HOVER] = nk_rgb(0x89, 0xac, 0xf8);
         table[NK_COLOR_SLIDER_CURSOR_ACTIVE] = nk_rgb(0x3d, 0x59, 0xa1);
-        table[NK_COLOR_PROPERTY] = nk_rgb(0x16, 0x16, 0x1e);
-        table[NK_COLOR_EDIT] = nk_rgb(0x16, 0x16, 0x1e);
+        table[NK_COLOR_PROPERTY] = nk_rgb(0x1a, 0x1b, 0x26);
+        table[NK_COLOR_EDIT] = nk_rgb(0x1a, 0x1b, 0x26);
         table[NK_COLOR_EDIT_CURSOR] = nk_rgb(0xc0, 0xca, 0xf5);
         table[NK_COLOR_COMBO] = nk_rgb(0x29, 0x2e, 0x42);
-        table[NK_COLOR_CHART] = nk_rgb(0x16, 0x16, 0x1e);
+        table[NK_COLOR_CHART] = nk_rgb(0x1a, 0x1b, 0x26);
         table[NK_COLOR_CHART_COLOR] = nk_rgb(0x7a, 0xa2, 0xf7);
         table[NK_COLOR_CHART_COLOR_HIGHLIGHT] = nk_rgb(0xf7, 0x76, 0x8e);
-        table[NK_COLOR_SCROLLBAR] = nk_rgb(0x16, 0x16, 0x1e);
+        table[NK_COLOR_SCROLLBAR] = nk_rgb(0x1f, 0x23, 0x35);
         table[NK_COLOR_SCROLLBAR_CURSOR] = nk_rgb(0x3b, 0x42, 0x61);
         table[NK_COLOR_SCROLLBAR_CURSOR_HOVER] = nk_rgb(0x54, 0x5c, 0x7e);
         table[NK_COLOR_SCROLLBAR_CURSOR_ACTIVE] = nk_rgb(0x7a, 0xa2, 0xf7);
         table[NK_COLOR_TAB_HEADER] = nk_rgb(0x16, 0x16, 0x1e);
 
+        card_col = nk_rgb(0x1f, 0x23, 0x35);
         accent  = nk_rgb(0x7a, 0xa2, 0xf7);
         ok_col  = nk_rgb(0x9e, 0xce, 0x6a);
         warn_col = nk_rgb(0xe0, 0xaf, 0x68);
         err_col = nk_rgb(0xf7, 0x76, 0x8e);
-        dim_col = nk_rgb(0x78, 0x7c, 0x99);
-        heading_col = nk_rgb(0xcd, 0xd6, 0xf4);
+        dim_col = nk_rgb(0x73, 0x7a, 0xa2);
+        heading_col = nk_rgb(0xc0, 0xca, 0xf5);
         log_col = nk_rgb(0xa9, 0xb1, 0xd6);
 
         btn_normal = nk_rgb(0x3d, 0x59, 0xa1);
-        btn_hover  = nk_rgb(0x51, 0x6c, 0xb3);
+        btn_hover  = nk_rgb(0x4a, 0x69, 0xb8);
         btn_active = nk_rgb(0x7a, 0xa2, 0xf7);
     } else {
         table[NK_COLOR_TEXT] = nk_rgb(0x34, 0x3b, 0x58);
         table[NK_COLOR_WINDOW] = nk_rgb(0xe1, 0xe2, 0xe7);
-        table[NK_COLOR_HEADER] = nk_rgb(0xd5, 0xd6, 0xdb);
-        table[NK_COLOR_BORDER] = nk_rgb(0xb7, 0xba, 0xcd);
-        table[NK_COLOR_BUTTON] = nk_rgb(0xd5, 0xd6, 0xdb);
-        table[NK_COLOR_BUTTON_HOVER] = nk_rgb(0xc2, 0xc8, 0xe0);
-        table[NK_COLOR_BUTTON_ACTIVE] = nk_rgb(0x2e, 0x7d, 0xe9);
-        table[NK_COLOR_TOGGLE] = nk_rgb(0xc4, 0xc8, 0xda);
-        table[NK_COLOR_TOGGLE_HOVER] = nk_rgb(0xb0, 0xb6, 0xcc);
+        table[NK_COLOR_HEADER] = nk_rgb(0xe1, 0xe2, 0xe7);
+        table[NK_COLOR_BORDER] = nk_rgb(0xc4, 0xc8, 0xda);
+        table[NK_COLOR_BUTTON] = nk_rgb(0xe4, 0xe6, 0xee);
+        table[NK_COLOR_BUTTON_HOVER] = nk_rgb(0xd3, 0xd7, 0xe6);
+        table[NK_COLOR_BUTTON_ACTIVE] = nk_rgb(0xb9, 0xc6, 0xec);
+        table[NK_COLOR_TOGGLE] = nk_rgb(0xd5, 0xd8, 0xe5);
+        table[NK_COLOR_TOGGLE_HOVER] = nk_rgb(0xc4, 0xc8, 0xda);
         table[NK_COLOR_TOGGLE_CURSOR] = nk_rgb(0x2e, 0x7d, 0xe9);
-        table[NK_COLOR_SELECT] = nk_rgb(0xc4, 0xc8, 0xda);
+        table[NK_COLOR_SELECT] = nk_rgb(0xd5, 0xd8, 0xe5);
         table[NK_COLOR_SELECT_ACTIVE] = nk_rgb(0x2e, 0x7d, 0xe9);
-        table[NK_COLOR_SLIDER] = nk_rgb(0xc4, 0xc8, 0xda);
+        table[NK_COLOR_SLIDER] = nk_rgb(0xd5, 0xd8, 0xe5);
         table[NK_COLOR_SLIDER_CURSOR] = nk_rgb(0x2e, 0x7d, 0xe9);
         table[NK_COLOR_SLIDER_CURSOR_HOVER] = nk_rgb(0x4a, 0x8f, 0xef);
         table[NK_COLOR_SLIDER_CURSOR_ACTIVE] = nk_rgb(0x1b, 0x66, 0xd0);
-        table[NK_COLOR_PROPERTY] = nk_rgb(0xd5, 0xd6, 0xdb);
-        table[NK_COLOR_EDIT] = nk_rgb(0xf5, 0xf6, 0xfa);
+        table[NK_COLOR_PROPERTY] = nk_rgb(0xff, 0xff, 0xff);
+        table[NK_COLOR_EDIT] = nk_rgb(0xff, 0xff, 0xff);
         table[NK_COLOR_EDIT_CURSOR] = nk_rgb(0x34, 0x3b, 0x58);
-        table[NK_COLOR_COMBO] = nk_rgb(0xd5, 0xd6, 0xdb);
-        table[NK_COLOR_CHART] = nk_rgb(0xd5, 0xd6, 0xdb);
+        table[NK_COLOR_COMBO] = nk_rgb(0xe4, 0xe6, 0xee);
+        table[NK_COLOR_CHART] = nk_rgb(0xd5, 0xd8, 0xe5);
         table[NK_COLOR_CHART_COLOR] = nk_rgb(0x2e, 0x7d, 0xe9);
         table[NK_COLOR_CHART_COLOR_HIGHLIGHT] = nk_rgb(0xf5, 0x2a, 0x65);
-        table[NK_COLOR_SCROLLBAR] = nk_rgb(0xd5, 0xd6, 0xdb);
-        table[NK_COLOR_SCROLLBAR_CURSOR] = nk_rgb(0xa8, 0xae, 0xc7);
+        table[NK_COLOR_SCROLLBAR] = nk_rgb(0xf4, 0xf5, 0xf8);
+        table[NK_COLOR_SCROLLBAR_CURSOR] = nk_rgb(0xb8, 0xbd, 0xd2);
         table[NK_COLOR_SCROLLBAR_CURSOR_HOVER] = nk_rgb(0x8b, 0x92, 0xb0);
         table[NK_COLOR_SCROLLBAR_CURSOR_ACTIVE] = nk_rgb(0x2e, 0x7d, 0xe9);
-        table[NK_COLOR_TAB_HEADER] = nk_rgb(0xd5, 0xd6, 0xdb);
+        table[NK_COLOR_TAB_HEADER] = nk_rgb(0xe1, 0xe2, 0xe7);
 
+        card_col = nk_rgb(0xf4, 0xf5, 0xf8);
         accent  = nk_rgb(0x2e, 0x7d, 0xe9);
-        ok_col  = nk_rgb(0x58, 0x75, 0x39);
+        ok_col  = nk_rgb(0x48, 0x7a, 0x27);
         warn_col = nk_rgb(0x8c, 0x6c, 0x3e);
-        err_col = nk_rgb(0xf5, 0x2a, 0x65);
-        dim_col = nk_rgb(0x84, 0x8c, 0xb5);
+        err_col = nk_rgb(0xd2, 0x1f, 0x52);
+        dim_col = nk_rgb(0x6c, 0x76, 0xa6);
         heading_col = nk_rgb(0x34, 0x3b, 0x58);
-        log_col = nk_rgb(0x56, 0x5d, 0x74);
+        log_col = nk_rgb(0x4c, 0x53, 0x6e);
 
         btn_normal = nk_rgb(0x2e, 0x7d, 0xe9);
         btn_hover  = nk_rgb(0x4a, 0x8f, 0xef);
@@ -259,6 +310,12 @@ set_theme(struct nk_context *ctx, int dark)
 
 /* ── drop handling ────────────────────────────────────────────────────── */
 
+static const char *
+output_suffix(void)
+{
+    return g.mode_decrypt ? "_decrypted" : "_encrypted";
+}
+
 static void
 on_drop(const char *path, void *ud)
 {
@@ -272,7 +329,7 @@ on_drop(const char *path, void *ud)
     if (g.input[0] == '\0') {
         snprintf(g.input, sizeof(g.input), "%s", path);
         if (g.output[0] == '\0')
-            snprintf(g.output, sizeof(g.output), "%s_decrypted", path);
+            snprintf(g.output, sizeof(g.output), "%s%s", path, output_suffix());
     } else {
         snprintf(g.output, sizeof(g.output), "%s", path);
     }
@@ -282,334 +339,442 @@ on_drop(const char *path, void *ud)
 
 /* ── small UI helpers ─────────────────────────────────────────────────── */
 
-/* icon + bold section header */
-static void
-heading(struct nk_context *ctx, unsigned icon, const char *text)
+/* Every multi-column row below is a template row: static columns are
+ * fixed, dynamic ones share what is left *after* Nuklear's inter-item
+ * spacing — so rows fill the width exactly and nothing is clipped on the
+ * right edge (the v1.1.0 layout summed widths to the full width and lost
+ * 10 px per gap). */
+
+static float
+text_width(const struct nk_user_font *f, const char *s)
 {
-    int p;
-    struct nk_rect content = nk_window_get_content_region(ctx);
-    float icon_w = content.w < 56.0f ? content.w * 0.25f : 28.0f;
-    float text_w = content.w - icon_w;
-    if (text_w < 1.0f) text_w = 1.0f;
-    nk_layout_row_begin(ctx, NK_STATIC, 28, 2);
-    nk_layout_row_push(ctx, icon_w);
-    p = push_font(ctx, f_icons);
-    nk_label_colored(ctx, ico(icon), NK_TEXT_LEFT, accent);
+    return f ? f->width(f->userdata, f->height, s, (int)strlen(s)) : 0.0f;
+}
+
+static void
+icon_label(struct nk_context *ctx, unsigned icon, struct nk_color col)
+{
+    int p = push_font(ctx, f_icons);
+    nk_label_colored(ctx, ico(icon), NK_TEXT_CENTERED, col);
     if (p) nk_style_pop_font(ctx);
-    nk_layout_row_push(ctx, text_w);
+}
+
+/* Card title: icon + bold text, with an optional small action button on
+ * the right. Returns 1 when the action was clicked. */
+static int
+card_title(struct nk_context *ctx, unsigned icon, const char *text, const char *action)
+{
+    int p, clicked = 0;
+    nk_layout_row_template_begin(ctx, S(TITLE_H));
+    nk_layout_row_template_push_static(ctx, S(ICON_W));
+    nk_layout_row_template_push_dynamic(ctx);
+    if (action) nk_layout_row_template_push_static(ctx, S(72));
+    nk_layout_row_template_end(ctx);
+    icon_label(ctx, icon, accent);
     p = push_font(ctx, f_bold);
     nk_label_colored(ctx, text, NK_TEXT_LEFT, heading_col);
     if (p) nk_style_pop_font(ctx);
-    nk_layout_row_end(ctx);
+    if (action) clicked = nk_button_label(ctx, action);
+    return clicked;
 }
 
-/* icon + single-line status message */
+/* Indented status line aligned with the field column. */
 static void
-status_line(struct nk_context *ctx, unsigned icon, const char *text,
-            struct nk_color col)
+status_line(struct nk_context *ctx, unsigned icon, const char *text, struct nk_color col)
+{
+    nk_layout_row_template_begin(ctx, S(LINE_H));
+    nk_layout_row_template_push_static(ctx, S(LABEL_W) - S(ICON_W) - S(GAP));
+    nk_layout_row_template_push_static(ctx, S(ICON_W));
+    nk_layout_row_template_push_dynamic(ctx);
+    nk_layout_row_template_end(ctx);
+    nk_spacing(ctx, 1);
+    icon_label(ctx, icon, col);
+    nk_label_colored(ctx, text, NK_TEXT_LEFT, col);
+}
+
+/* label | edit field | optional button of `button_w` (96-DPI px) with an
+ * optional tooltip. Returns 1 when the button was clicked. */
+static int
+field_row(struct nk_context *ctx, const char *label, char *buf, int len,
+          const char *button, float button_w, const char *tip,
+          nk_plugin_filter filter)
+{
+    int clicked = 0, hovered;
+    nk_layout_row_template_begin(ctx, S(ROW_H));
+    nk_layout_row_template_push_static(ctx, S(LABEL_W));
+    nk_layout_row_template_push_dynamic(ctx);
+    if (button) nk_layout_row_template_push_static(ctx, S(button_w));
+    nk_layout_row_template_end(ctx);
+    nk_label(ctx, label, NK_TEXT_LEFT);
+    nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, buf, len, filter);
+    if (button) {
+        hovered = tip && nk_widget_is_hovered(ctx);
+        clicked = nk_button_label(ctx, button);
+        if (hovered) nk_tooltip(ctx, tip);
+    }
+    return clicked;
+}
+
+/* label | radio A | radio B | spacer. Returns the selected index. */
+static int
+choice_row(struct nk_context *ctx, const char *label, const char *a,
+           const char *b, int selected)
+{
+    nk_layout_row_template_begin(ctx, S(CHECK_H));
+    nk_layout_row_template_push_static(ctx, S(LABEL_W));
+    nk_layout_row_template_push_static(ctx, S(116));
+    nk_layout_row_template_push_static(ctx, S(116));
+    nk_layout_row_template_push_dynamic(ctx);
+    nk_layout_row_template_end(ctx);
+    nk_label(ctx, label, NK_TEXT_LEFT);
+    if (nk_option_label(ctx, a, selected == 0)) selected = 0;
+    if (nk_option_label(ctx, b, selected == 1)) selected = 1;
+    /* An empty label, not nk_spacing(): spacing in the last template column
+     * wraps to a new row and leaves a blank line. */
+    nk_label(ctx, "", NK_TEXT_LEFT);
+    return selected;
+}
+
+/* label column spacer + one or two checkboxes sharing the rest (a lone
+ * checkbox gets the whole width, so its label is never cut short). */
+static void
+check_row(struct nk_context *ctx, const char *a, int *va, const char *b, int *vb)
+{
+    nk_layout_row_template_begin(ctx, S(CHECK_H));
+    nk_layout_row_template_push_static(ctx, S(LABEL_W));
+    nk_layout_row_template_push_dynamic(ctx);
+    if (b) nk_layout_row_template_push_dynamic(ctx);
+    nk_layout_row_template_end(ctx);
+    nk_spacing(ctx, 1);
+    nk_checkbox_label(ctx, a, va);
+    if (b) nk_checkbox_label(ctx, b, vb);
+}
+
+static int
+card_begin(struct nk_context *ctx, const char *name)
+{
+    return nk_group_begin(ctx, name, NK_WINDOW_BORDER | NK_WINDOW_NO_SCROLLBAR);
+}
+
+/* ── cards ────────────────────────────────────────────────────────────── */
+
+static float
+folders_card_h(void)
+{
+    return card_h(S(TITLE_H) + 2 * S(ROW_H) + S(LINE_H), 4);
+}
+
+static void
+folders_card(struct nk_context *ctx)
 {
     int p;
-    struct nk_rect content = nk_window_get_content_region(ctx);
-    float icon_w = content.w < 56.0f ? content.w * 0.25f : 28.0f;
-    float text_w = content.w - icon_w;
-    if (text_w < 1.0f) text_w = 1.0f;
-    nk_layout_row_begin(ctx, NK_STATIC, 24, 2);
-    nk_layout_row_push(ctx, icon_w);
-    p = push_font(ctx, f_icons);
-    nk_label_colored(ctx, ico(icon), NK_TEXT_LEFT, col);
+    nk_layout_row_dynamic(ctx, folders_card_h(), 1);
+    if (!card_begin(ctx, "folders")) return;
+    card_title(ctx, ICON_FOLDER, "Folders", NULL);
+    if (field_row(ctx, "Input", g.input, BUF_LEN, "Browse...", BTN_W, NULL, NULL)) {
+        if (rmd_zig_pick_folder("Select input folder", g.input, BUF_LEN) > 0 &&
+            g.output[0] == '\0')
+            snprintf(g.output, sizeof(g.output), "%s%s", g.input, output_suffix());
+    }
+    if (field_row(ctx, "Output", g.output, BUF_LEN, "Browse...", BTN_W, NULL, NULL))
+        rmd_zig_pick_folder("Select output folder", g.output, BUF_LEN);
+    nk_layout_row_template_begin(ctx, S(LINE_H));
+    nk_layout_row_template_push_static(ctx, S(LABEL_W));
+    nk_layout_row_template_push_dynamic(ctx);
+    nk_layout_row_template_end(ctx);
+    nk_spacing(ctx, 1);
+    p = push_font(ctx, f_italic);
+    nk_label_colored(ctx,
+        "Tip: drag a folder from Explorer onto the window to fill the next empty field.",
+        NK_TEXT_LEFT, dim_col);
     if (p) nk_style_pop_font(ctx);
-    nk_layout_row_push(ctx, text_w);
-    nk_label_colored(ctx, text, NK_TEXT_LEFT, col);
-    nk_layout_row_end(ctx);
+    nk_group_end(ctx);
 }
 
-/* label + edit + button row; returns 1 when the button was clicked */
-static int
-path_row(struct nk_context *ctx, const char *label, char *buf,
-         const char *button, nk_plugin_filter filter)
+static float
+key_card_h(void)
 {
-    int clicked;
-    struct nk_rect content = nk_window_get_content_region(ctx);
-    float label_w = 95.0f;
-    float button_w = 260.0f;
-    float edit_w;
+    return card_h(S(TITLE_H) + 2 * S(ROW_H) + 2 * S(LINE_H), 5);
+}
 
-    /* Keep labels compact, reserve a sensible Browse/Auto-Detect width,
-     * and give the path/key field every remaining pixel. */
-    if (content.w < 700.0f) {
-        label_w = content.w * 0.17f;
-        button_w = content.w * 0.24f;
+static float
+options_card_h(void)
+{
+    return card_h(S(TITLE_H) + 4 * S(CHECK_H), 5);
+}
+
+static void
+key_card(struct nk_context *ctx)
+{
+    static const char default_header[] = "5250474d560000000003010000000000";
+    size_t klen, hlen;
+    if (!card_begin(ctx, "key")) return;
+    card_title(ctx, ICON_KEY, "Encryption Key", NULL);
+    if (field_row(ctx, "Key (hex)", g.key_hex, 33, "Detect", DETECT_W,
+                  "Auto-detect the key from the input folder", nk_filter_hex)) {
+        if (g.input[0] == '\0')
+            rmd_zig_log("  x choose an input folder first", 1);
+        else if (rmd_zig_detect_key(g.input, g.key_hex, 33) == 0)
+            rmd_zig_log("  x no encryption key found - PNGs can still be restored", 1);
     }
-    edit_w = content.w - label_w - button_w;
-    if (edit_w < 1.0f) edit_w = 1.0f;
+    klen = strlen(g.key_hex);
+    if (klen == 32)
+        status_line(ctx, ICON_CHECK, "Key ready (16 bytes)", ok_col);
+    else if (klen > 0) {
+        char kmsg[96];
+        snprintf(kmsg, sizeof(kmsg), "Key needs 32 hex characters (have %d)", (int)klen);
+        status_line(ctx, ICON_WARNING, kmsg, warn_col);
+    } else
+        status_line(ctx, ICON_INFO, "No key: auto-detected on start; PNGs restore without one", dim_col);
 
-    nk_layout_row_begin(ctx, NK_STATIC, 32, 3);
-    nk_layout_row_push(ctx, label_w);
-    nk_label(ctx, label, NK_TEXT_LEFT);
-    nk_layout_row_push(ctx, edit_w);
-    nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, buf, BUF_LEN, filter);
-    nk_layout_row_push(ctx, button_w);
-    clicked = nk_button_label(ctx, button);
-    nk_layout_row_end(ctx);
-    return clicked;
+    if (field_row(ctx, "Fake header", g.header_hex, (int)sizeof(g.header_hex), "Reset", RESET_W,
+                  "Restore the standard RPG Maker header", nk_filter_hex))
+        snprintf(g.header_hex, sizeof(g.header_hex), "%s", default_header);
+    hlen = strlen(g.header_hex);
+    if (hlen != 32) {
+        char hmsg[96];
+        snprintf(hmsg, sizeof(hmsg), "Header needs 32 hex characters (have %d)", (int)hlen);
+        status_line(ctx, ICON_WARNING, hmsg, warn_col);
+    } else if (_stricmp(g.header_hex, default_header) == 0)
+        status_line(ctx, ICON_CHECK, "Standard RPG Maker MV/MZ header", dim_col);
+    else
+        status_line(ctx, ICON_WARNING, "Custom header - only for modified engines", warn_col);
+    nk_group_end(ctx);
+}
+
+static void
+options_card(struct nk_context *ctx)
+{
+    if (!card_begin(ctx, "options")) return;
+    card_title(ctx, ICON_GEAR, "Options", NULL);
+    g.mode_decrypt = choice_row(ctx, "Mode", "Decrypt", "Encrypt", g.mode_decrypt ? 0 : 1) == 0;
+    /* Decryption accepts MV and MZ files alike; the format only names the
+     * extensions encryption writes. */
+    if (g.mode_decrypt) nk_widget_disable_begin(ctx);
+    g.mz = choice_row(ctx, "Format", "MV", "MZ", g.mz);
+    if (g.mode_decrypt) nk_widget_disable_end(ctx);
+    check_row(ctx, "Overwrite existing", &g.overwrite, "Ignore header", &g.ignore_header);
+    check_row(ctx, "Clean output folder first", &g.clean_output, NULL, NULL);
+    nk_group_end(ctx);
 }
 
 /* ── frame ────────────────────────────────────────────────────────────── */
 
 static void
+header_row(struct nk_context *ctx)
+{
+    int p, hovered;
+    nk_layout_row_template_begin(ctx, S(HEADER_H));
+    nk_layout_row_template_push_static(ctx, S(ICON_W) + S(4));
+    nk_layout_row_template_push_static(ctx, text_width(f_title, "rmdecrypt") + S(4));
+    nk_layout_row_template_push_dynamic(ctx);
+    nk_layout_row_template_push_static(ctx, S(HEADER_H));
+    nk_layout_row_template_end(ctx);
+
+    icon_label(ctx, ICON_UNLOCK, accent);
+    p = push_font(ctx, f_title);
+    nk_label(ctx, "rmdecrypt", NK_TEXT_LEFT);
+    if (p) nk_style_pop_font(ctx);
+    nk_label_colored(ctx, "v" VERSION "  \xC2\xB7  RPG Maker MV/MZ asset decrypter",
+                     NK_TEXT_LEFT, dim_col);
+
+    /* square icon button; the template above keeps it fully inside the
+     * row, so all four rounded corners are drawn */
+    hovered = nk_widget_is_hovered(ctx);
+    p = push_font(ctx, f_icons);
+    if (nk_button_label(ctx, ico(g.dark ? ICON_SUN : ICON_MOON))) {
+        g.dark = !g.dark;
+        set_theme(ctx, g.dark);
+    }
+    if (p) nk_style_pop_font(ctx);
+    if (hovered)
+        nk_tooltip(ctx, g.dark ? "Switch to light theme" : "Switch to dark theme");
+}
+
+static void
+actions(struct nk_context *ctx)
+{
+    int done, total, errors;
+    int can_start = g.input[0] != '\0' && g.status != ST_PROCESSING;
+    char left[160], right[64];
+    struct nk_color left_col = dim_col;
+    const char *btn =
+        g.status == ST_PROCESSING ? "Processing..." :
+        g.mode_decrypt ? "Start Decryption" : "Start Encryption";
+
+    nk_layout_row_dynamic(ctx, S(START_H), 1);
+    if (!can_start) nk_widget_disable_begin(ctx);
+    nk_style_push_style_item(ctx, &ctx->style.button.normal, nk_style_item_color(btn_normal));
+    nk_style_push_style_item(ctx, &ctx->style.button.hover, nk_style_item_color(btn_hover));
+    nk_style_push_style_item(ctx, &ctx->style.button.active, nk_style_item_color(btn_active));
+    nk_style_push_color(ctx, &ctx->style.button.border_color, btn_normal);
+    nk_style_push_color(ctx, &ctx->style.button.text_normal, nk_rgb(0xff, 0xff, 0xff));
+    nk_style_push_color(ctx, &ctx->style.button.text_hover, nk_rgb(0xff, 0xff, 0xff));
+    nk_style_push_color(ctx, &ctx->style.button.text_active, nk_rgb(0xff, 0xff, 0xff));
+    {
+        int p = push_font(ctx, f_bold);
+        if (nk_button_symbol_label(ctx, NK_SYMBOL_TRIANGLE_RIGHT, btn, NK_TEXT_CENTERED) && can_start) {
+            g.log_rendered = 0;
+            g.status = rmd_zig_scan(g.input, g.output, g.key_hex, g.header_hex,
+                                    g.mode_decrypt, g.mz, g.ignore_header,
+                                    g.overwrite, g.clean_output) > 0
+                ? ST_PROCESSING : ST_IDLE;
+        }
+        if (p) nk_style_pop_font(ctx);
+    }
+    nk_style_pop_color(ctx);
+    nk_style_pop_color(ctx);
+    nk_style_pop_color(ctx);
+    nk_style_pop_color(ctx);
+    nk_style_pop_style_item(ctx);
+    nk_style_pop_style_item(ctx);
+    nk_style_pop_style_item(ctx);
+    if (!can_start) nk_widget_disable_end(ctx);
+
+    rmd_zig_progress(&done, &total, &errors);
+    if (g.status == ST_PROCESSING && done >= total)
+        g.status = ST_DONE;
+
+    nk_layout_row_dynamic(ctx, S(BAR_H), 1);
+    {
+        nk_size cur = (nk_size)(g.status == ST_IDLE ? 0 : done);
+        nk_progress(ctx, &cur, (nk_size)(total > 0 ? total : 1), nk_false);
+    }
+
+    if (g.status == ST_IDLE) {
+        snprintf(left, sizeof(left), "Ready \xC2\xB7 %s",
+            g.mode_decrypt ? ".rpgmvp .rpgmvm .rpgmvo / .png_ .m4a_ .ogg_  ->  .png .m4a .ogg"
+            : g.mz ? ".png .m4a .ogg  ->  .png_ .m4a_ .ogg_"
+                   : ".png .m4a .ogg  ->  .rpgmvp .rpgmvm .rpgmvo");
+        right[0] = '\0';
+    } else {
+        if (g.status == ST_PROCESSING)
+            snprintf(left, sizeof(left), "Processing %d of %d files", done, total);
+        else if (errors > 0) {
+            snprintf(left, sizeof(left), "Finished with %d error%s - see the log", errors, errors == 1 ? "" : "s");
+            left_col = err_col;
+        } else {
+            snprintf(left, sizeof(left), "Done \xC2\xB7 %d files processed", done);
+            left_col = ok_col;
+        }
+        snprintf(right, sizeof(right), "%d / %d  \xC2\xB7  %d%%", done, total,
+                 total > 0 ? (done * 100) / total : 0);
+    }
+    nk_layout_row_template_begin(ctx, S(LINE_H));
+    nk_layout_row_template_push_dynamic(ctx);
+    nk_layout_row_template_push_static(ctx, S(180));
+    nk_layout_row_template_end(ctx);
+    nk_label_colored(ctx, left, NK_TEXT_LEFT, left_col);
+    nk_label_colored(ctx, right, NK_TEXT_RIGHT, accent);
+}
+
+static void
+log_card(struct nk_context *ctx, float h)
+{
+    int count, i, p;
+    float inner_h = h - 2.0f * S(CARD_PAD_Y) - 2.0f - S(TITLE_H) - S(GAP);
+    nk_layout_row_dynamic(ctx, h, 1);
+    if (!card_begin(ctx, "logcard")) return;
+    if (card_title(ctx, ICON_LIST, "Activity Log", "Clear")) {
+        rmd_zig_log_clear();
+        g.log_rendered = 0;
+    }
+    nk_layout_row_dynamic(ctx, inner_h > 1.0f ? inner_h : 1.0f, 1);
+    /* NOTE: nk_group_scrolled_offset_begin returns 0 WITHOUT pushing a
+     * panel when the group lies fully outside the clip rect, so
+     * nk_group_end must only run when begin succeeded. */
+    if (nk_group_scrolled_offset_begin(ctx, &g.log_sx, &g.log_sy, "log", 0)) {
+        nk_style_push_vec2(ctx, &ctx->style.window.spacing, nk_vec2(S(GAP), S(LOG_GAP)));
+        nk_layout_row_dynamic(ctx, S(LINE_H), 1);
+        count = rmd_zig_log_count();
+        if (count == 0) {
+            p = push_font(ctx, f_italic);
+            nk_label_colored(ctx, "No activity yet. Pick a folder and press Start.",
+                             NK_TEXT_LEFT, dim_col);
+            if (p) nk_style_pop_font(ctx);
+        }
+        for (i = 0; i < count; ++i) {
+            int is_err = 0;
+            const char *line = rmd_zig_log_get(i, &is_err);
+            if (line)
+                nk_label_colored(ctx, line, NK_TEXT_LEFT, is_err ? err_col : log_col);
+        }
+        nk_style_pop_vec2(ctx);
+        nk_group_end(ctx);
+    }
+    nk_group_end(ctx);
+
+    /* Snap to the bottom on new entries. The log owns its offsets
+     * (log_sx/log_sy), so set them directly — nk_group_set_scroll() writes
+     * Nuklear's internal copy, which this group never reads. The offset is
+     * computed from the row metrics (each row advances LINE_H + LOG_GAP), so the
+     * next frame lands exactly on the last line without a blank frame. */
+    count = rmd_zig_log_count();
+    if (count != g.log_rendered) {
+        float content = (float)count * (S(LINE_H) + S(LOG_GAP)) + 2.0f * S(CARD_PAD_Y)
+                      + ctx->style.window.scrollbar_size.y;
+        g.log_sy = content > inner_h ? (nk_uint)(content - inner_h) : 0;
+        g.log_rendered = count;
+    }
+}
+
+static void
 draw(struct nk_context *ctx, float win_w, float win_h)
 {
+    float content_w, top_h, fixed_h, log_h;
+    int wide, busy;
+    nk_flags flags = NK_WINDOW_BACKGROUND;
+
     /* OS-level minimize / 0x0 client area: drawing would make group bounds
      * fall outside the window clip rect, and nk_group_*_begin then returns
      * 0 without pushing a panel (unbalanced nk_group_end -> assert). */
     if (win_w < 1.0f || win_h < 1.0f)
         return;
-    /* Let the entire form scroll when a small window or high-DPI scaling
-     * makes the activity panel fall below the visible client area. The log
-     * itself keeps its own scrollbar for long operation output. */
-    if (nk_begin(ctx, "main", nk_rect(0, 0, win_w, win_h),
-            NK_WINDOW_BORDER | NK_WINDOW_SCROLL_AUTO_HIDE | NK_WINDOW_BACKGROUND))
+
+    content_w = win_w - 2.0f * S(PAD_X);
+    /* Key/Options side by side only when the key card's field can show all
+     * 32 hex characters; measured, so it holds at any DPI or font. */
     {
-        float used = 0;
-        int p;
-        struct nk_rect content = nk_window_get_content_region(ctx);
+        float key_card_w = 2.0f * S(CARD_PAD_X) + 2.0f + S(LABEL_W) + S(DETECT_W) + 2.0f * S(GAP)
+            + text_width(ctx->style.font, "00000000000000000000000000000000")
+            + 2.0f * ctx->style.edit.padding.x + S(12);
+        wide = (content_w - S(GAP)) * 0.5f >= key_card_w;
+    }
+    top_h = wide ? (key_card_h() > options_card_h() ? key_card_h() : options_card_h())
+                 : key_card_h() + S(GAP) + options_card_h();
+    fixed_h = S(HEADER_H) + folders_card_h() + top_h + S(START_H) + S(BAR_H) + S(LINE_H)
+            + 6.0f * S(GAP) + 2.0f * S(PAD_Y);
 
-        /* header: icon + title + dark/light toggle */
-        {
-            float icon_w = content.w < 56.0f ? content.w * 0.25f : 28.0f;
-            float theme_w = content.w < 420.0f ? content.w * 0.18f : 110.0f;
-            float title_w = content.w - icon_w - theme_w;
-            if (title_w < 1.0f) title_w = 1.0f;
-            nk_layout_row_begin(ctx, NK_STATIC, 40, 3);
-            nk_layout_row_push(ctx, icon_w);
-        p = push_font(ctx, f_icons);
-        nk_label_colored(ctx, ico(ICON_UNLOCK), NK_TEXT_LEFT, accent);
-        if (p) nk_style_pop_font(ctx);
-            nk_layout_row_push(ctx, title_w);
-        p = push_font(ctx, f_title);
-        nk_label(ctx, "rmdecrypt", NK_TEXT_LEFT);
-        if (p) nk_style_pop_font(ctx);
-            nk_layout_row_push(ctx, theme_w);
-        p = push_font(ctx, f_icons);
-        if (nk_button_label(ctx, ico(g.dark ? ICON_SUN : ICON_MOON))) {
-            g.dark = !g.dark;
-            set_theme(ctx, g.dark);
+    /* Scroll only when the window is too short for the form plus a usable
+     * log; otherwise reserve no scrollbar so both side margins match. */
+    if (win_h - fixed_h < S(LOG_MIN_H))
+        flags |= NK_WINDOW_SCROLL_AUTO_HIDE;
+    else
+        flags |= NK_WINDOW_NO_SCROLLBAR;
+
+    if (nk_begin(ctx, "main", nk_rect(0, 0, win_w, win_h), flags)) {
+        if (flags & NK_WINDOW_NO_SCROLLBAR)
+            nk_window_set_scroll(ctx, 0, 0);
+        busy = g.status == ST_PROCESSING;
+
+        header_row(ctx);
+        if (busy) nk_widget_disable_begin(ctx);
+        folders_card(ctx);
+        if (wide) {
+            nk_layout_row_dynamic(ctx, top_h, 2);
+            key_card(ctx);
+            options_card(ctx);
+        } else {
+            nk_layout_row_dynamic(ctx, key_card_h(), 1);
+            key_card(ctx);
+            nk_layout_row_dynamic(ctx, options_card_h(), 1);
+            options_card(ctx);
         }
-        if (p) nk_style_pop_font(ctx);
-        nk_layout_row_end(ctx);
-        }
+        if (busy) nk_widget_disable_end(ctx);
+        actions(ctx);
 
-        nk_layout_row_dynamic(ctx, 20, 1);
-        p = push_font(ctx, f_italic);
-        nk_label_colored(ctx,
-            "v" VERSION "  -  Decrypt or re-encrypt RPG Maker MV/MZ assets",
-            NK_TEXT_LEFT, dim_col);
-        if (p) nk_style_pop_font(ctx);
-
-        nk_layout_row_dynamic(ctx, 8, 1);
-        nk_spacing(ctx, 1);
-        used += 40 + 20 + 8 + 3 * ROW_GAP;
-
-        /* folders */
-        heading(ctx, ICON_FOLDER, "Folders");
-        if (path_row(ctx, "Input Folder", g.input, "Browse...", NULL)) {
-            if (rmd_zig_pick_folder("Select input folder", g.input, BUF_LEN) > 0 &&
-                g.output[0] == '\0')
-                snprintf(g.output, sizeof(g.output), "%s_decrypted", g.input);
-        }
-        if (path_row(ctx, "Output Folder", g.output, "Browse...", NULL))
-            rmd_zig_pick_folder("Select output folder", g.output, BUF_LEN);
-        nk_layout_row_dynamic(ctx, 18, 1);
-        p = push_font(ctx, f_italic);
-        nk_label_colored(ctx,
-            "Tip: drag a folder from Explorer onto the window - it fills the next empty field.",
-            NK_TEXT_LEFT, dim_col);
-        if (p) nk_style_pop_font(ctx);
-        used += 28 + 32 + 32 + 18 + 4 * ROW_GAP;
-
-        /* encryption key */
-        heading(ctx, ICON_KEY, "Encryption Key");
-        if (path_row(ctx, "Key (hex)", g.key_hex, "Auto-Detect", nk_filter_hex)) {
-            if (g.input[0] != '\0' &&
-                rmd_zig_detect_key(g.input, g.key_hex, BUF_LEN) == 0)
-                rmd_zig_log("  x could not find an encryption key in that folder"
-                            " - PNGs will be restored without a key, audio skipped", 1);
-        }
-        {
-            size_t klen = strlen(g.key_hex);
-            if (klen == 32) {
-                status_line(ctx, ICON_CHECK, "Key ready (16 bytes)", ok_col);
-            } else if (klen > 0) {
-                char kmsg[96];
-                snprintf(kmsg, sizeof(kmsg),
-                         "Invalid key length (%d hex chars - need 32)", (int)klen);
-                status_line(ctx, ICON_WARNING, kmsg, warn_col);
-            } else {
-                status_line(ctx, ICON_INFO,
-                    "No key set - PNG files will be restored without decryption",
-                    dim_col);
-            }
-        }
-        used += 28 + 32 + 20 + 3 * ROW_GAP;
-
-        /* options */
-        heading(ctx, ICON_GEAR, "Options");
-        nk_layout_row_begin(ctx, NK_DYNAMIC, 28, 6);
-        nk_layout_row_push(ctx, 0.14f);
-        nk_label(ctx, "Mode", NK_TEXT_LEFT);
-        nk_layout_row_push(ctx, 0.22f);
-        if (nk_option_label(ctx, "Decrypt", g.mode_decrypt)) g.mode_decrypt = 1;
-        nk_layout_row_push(ctx, 0.22f);
-        if (nk_option_label(ctx, "Encrypt", !g.mode_decrypt)) g.mode_decrypt = 0;
-        nk_layout_row_push(ctx, 0.16f);
-        nk_label(ctx, "Format", NK_TEXT_LEFT);
-        nk_layout_row_push(ctx, 0.13f);
-        if (nk_option_label(ctx, "MV", !g.mz)) g.mz = 0;
-        nk_layout_row_push(ctx, 0.13f);
-        if (nk_option_label(ctx, "MZ", g.mz)) g.mz = 1;
-        nk_layout_row_end(ctx);
-
-        nk_layout_row_dynamic(ctx, 24, 2);
-        nk_checkbox_label(ctx, "Ignore invalid fake header", &g.ignore_header);
-        nk_checkbox_label(ctx, "Overwrite existing output", &g.overwrite);
-
-        nk_layout_row_dynamic(ctx, 24, 2);
-        nk_checkbox_label(ctx, "Clean output before start", &g.clean_output);
-        nk_label(ctx, "Fake header (hex)", NK_TEXT_LEFT);
-        nk_layout_row_dynamic(ctx, 28, 1);
-        nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, g.header_hex,
-                                       (int)sizeof(g.header_hex), nk_filter_hex);
-
-        nk_layout_row_dynamic(ctx, 20, 1);
-        p = push_font(ctx, f_italic);
-        nk_label_colored(ctx,
-            g.mode_decrypt
-                ? (g.mz ? "Will decrypt .png_ .m4a_ .ogg_ -> .png .m4a .ogg"
-                        : "Will decrypt .rpgmvp .rpgmvm .rpgmvo -> .png .m4a .ogg")
-                : (g.mz ? "Will encrypt .png .m4a .ogg -> .png_ .m4a_ .ogg_"
-                        : "Will encrypt .png .m4a .ogg -> .rpgmvp .rpgmvm .rpgmvo"),
-            NK_TEXT_LEFT, dim_col);
-        if (p) nk_style_pop_font(ctx);
-        used += 28 + 28 + 24 + 24 + 28 + 20 + 6 * ROW_GAP;
-
-        /* start button */
-        {
-            int can_start = g.input[0] != '\0' && g.status != ST_PROCESSING;
-            const char *btn =
-                g.status == ST_PROCESSING ? "Processing..." :
-                g.mode_decrypt ? "Start Decryption" : "Start Encryption";
-            nk_layout_row_dynamic(ctx, 8, 1);
-            nk_spacing(ctx, 1);
-            nk_layout_row_dynamic(ctx, 46, 1);
-            if (!can_start) nk_widget_disable_begin(ctx);
-            nk_style_push_style_item(ctx, &ctx->style.button.normal,
-                nk_style_item_color(btn_normal));
-            nk_style_push_style_item(ctx, &ctx->style.button.hover,
-                nk_style_item_color(btn_hover));
-            nk_style_push_style_item(ctx, &ctx->style.button.active,
-                nk_style_item_color(btn_active));
-            nk_style_push_color(ctx, &ctx->style.button.text_normal,
-                nk_rgb(0xff, 0xff, 0xff));
-            nk_style_push_color(ctx, &ctx->style.button.text_hover,
-                nk_rgb(0xff, 0xff, 0xff));
-            nk_style_push_color(ctx, &ctx->style.button.text_active,
-                nk_rgb(0xff, 0xff, 0xff));
-            if (nk_button_symbol_label(ctx, NK_SYMBOL_TRIANGLE_RIGHT, btn,
-                                       NK_TEXT_CENTERED) && can_start) {
-                if (rmd_zig_scan(g.input, g.output, g.key_hex, g.header_hex,
-                                 g.mode_decrypt, g.mz, g.ignore_header,
-                                 g.overwrite, g.clean_output) > 0)
-                    g.status = ST_PROCESSING;
-                else
-                    g.status = ST_IDLE;
-            }
-            nk_style_pop_color(ctx);
-            nk_style_pop_color(ctx);
-            nk_style_pop_color(ctx);
-            nk_style_pop_style_item(ctx);
-            nk_style_pop_style_item(ctx);
-            nk_style_pop_style_item(ctx);
-            if (!can_start) nk_widget_disable_end(ctx);
-            used += 8 + 46 + 2 * ROW_GAP;
-        }
-
-        /* progress */
-        if (g.status == ST_PROCESSING || g.status == ST_DONE) {
-            int done, total, errors;
-            char stbuf[96];
-            rmd_zig_progress(&done, &total, &errors);
-
-            nk_layout_row_dynamic(ctx, 18, 1);
-            {
-                nk_size cur = (nk_size)done;
-                nk_progress(ctx, &cur, (nk_size)total, nk_false);
-            }
-
-            nk_layout_row_begin(ctx, NK_DYNAMIC, 24, 3);
-            nk_layout_row_push(ctx, 0.36f);
-            snprintf(stbuf, sizeof(stbuf), "%d / %d processed", done, total);
-            nk_label(ctx, stbuf, NK_TEXT_LEFT);
-            nk_layout_row_push(ctx, 0.28f);
-            if (errors > 0) {
-                snprintf(stbuf, sizeof(stbuf), "%d errors", errors);
-                nk_label_colored(ctx, stbuf, NK_TEXT_LEFT, err_col);
-            } else {
-                nk_label(ctx, "", NK_TEXT_LEFT);
-            }
-            nk_layout_row_push(ctx, 0.36f);
-            snprintf(stbuf, sizeof(stbuf), "%d%%",
-                     total > 0 ? (done * 100) / total : 0);
-            nk_label_colored(ctx, stbuf, NK_TEXT_RIGHT, accent);
-            nk_layout_row_end(ctx);
-
-            if (g.status == ST_PROCESSING && done >= total)
-                g.status = ST_DONE;
-            used += 18 + 24 + 2 * ROW_GAP;
-        }
-
-        /* activity log (fills remaining space) */
-        heading(ctx, ICON_LIST, "Activity Log");
-        used += 28 + ROW_GAP;
-        {
-            float log_h = win_h - used - 46.0f;
-            int count, i;
-            if (log_h < 60.0f) log_h = 60.0f;
-            nk_layout_row_dynamic(ctx, log_h, 1);
-            /* NOTE: nk_group_scrolled_offset_begin returns 0 WITHOUT
-             * pushing a panel when the group bounds lie fully outside the
-             * window clip rect (tiny window). nk_group_end must therefore
-             * only run when begin succeeded, otherwise it pops the main
-             * window's own layout (g->parent assert in nuklear.h). */
-            if (nk_group_scrolled_offset_begin(ctx, &g.log_sx, &g.log_sy,
-                                               "log", 0))
-            {
-                nk_layout_row_dynamic(ctx, 20, 1);
-                count = rmd_zig_log_count();
-                if (count == 0) {
-                    p = push_font(ctx, f_italic);
-                    nk_label_colored(ctx,
-                        "No activity yet. Pick a folder and press Start.",
-                        NK_TEXT_LEFT, dim_col);
-                    if (p) nk_style_pop_font(ctx);
-                } else {
-                    for (i = 0; i < count; ++i) {
-                        int is_err = 0;
-                        const char *line = rmd_zig_log_get(i, &is_err);
-                        if (line)
-                            nk_label_colored(ctx, line, NK_TEXT_LEFT,
-                                             is_err ? err_col : log_col);
-                    }
-                }
-                nk_group_end(ctx);
-            }
-
-            /* snap to bottom on new entries */
-            count = rmd_zig_log_count();
-            if (count > g.log_rendered) {
-                nk_group_set_scroll(ctx, "log", 0, 0xFFFFFFFFu);
-                g.log_rendered = count;
-            }
-        }
+        log_h = win_h - fixed_h;
+        log_card(ctx, log_h < S(LOG_MIN_H) ? S(LOG_MIN_H) : log_h);
     }
     nk_end(ctx);
 }
@@ -619,9 +784,27 @@ draw(struct nk_context *ctx, float win_w, float win_h)
 /* Headless self-test (mirrors btworkshop's --test mode): set
  * RMD_TEST_INPUT (and optionally RMD_TEST_OUTPUT) to fill the fields,
  * auto-detect the key, run the job to completion, dump the log to
- * stdout and exit. Exit code 0 = success, 3 = errors during processing.
- * RMD_TEST_LIGHT=1 additionally starts in light mode. */
+ * stdout and exit. Exit code 0 = success, 2 = the job could not start
+ * (see log), 3 = errors during processing. RMD_TEST_KEY=<hex> supplies the
+ * key instead of auto-detecting it, RMD_TEST_LIGHT=1 starts in light mode,
+ * and RMD_TEST_HOLD=1 keeps the window open after the job (for screenshots)
+ * instead of exiting. */
 static int g_test_mode = 0;
+static int g_test_scan_failed = 0;
+
+/* One complete frame. Called by the main loop, and by nk_shim.c from the
+ * WndProc while Windows runs its modal move/size loop (live resize). */
+static void
+frame(void *ud)
+{
+    int w, h;
+    struct nk_context *ctx = ud;
+    nkshim_get_client_size(&w, &h);
+    draw(ctx, (float)w, (float)h);
+    if (g.status == ST_PROCESSING)
+        rmd_zig_step(BATCH);
+    nkshim_render();
+}
 
 int
 rmd_gui_main(void)
@@ -638,6 +821,7 @@ rmd_gui_main(void)
         "rmdecrypt v" VERSION " - RPG Maker MV/MZ Asset Tool");
     if (!ctx)
         return 1;
+    g_scale = nkshim_dpi_scale();
     grab_fonts();
 
     {
@@ -656,25 +840,26 @@ rmd_gui_main(void)
                 g.dark = 0;
             g.mode_decrypt = !test_encrypt;
             g.mz = test_mz;
-            rmd_zig_detect_key(g.input, g.key_hex, BUF_LEN);
+            if (GetEnvironmentVariableA("RMD_TEST_KEY", tin, (DWORD)sizeof(tin)) > 0)
+                snprintf(g.key_hex, sizeof(g.key_hex), "%s", tin);
+            else
+                rmd_zig_detect_key(g.input, g.key_hex, BUF_LEN);
             if (rmd_zig_scan(g.input, g.output, g.key_hex, g.header_hex,
                              g.mode_decrypt, g.mz, g.ignore_header,
                              g.overwrite, g.clean_output) > 0)
                 g.status = ST_PROCESSING;
-            g_test_mode = 1;
+            else
+                g_test_scan_failed = 1;
+            g_test_mode = !(GetEnvironmentVariableA("RMD_TEST_HOLD", tval, (DWORD)sizeof(tval)) > 0 && tval[0] == '1');
         }
     }
 
     set_theme(ctx, g.dark);
     nkshim_set_drop_callback(on_drop, NULL);
+    nkshim_set_frame_callback(frame, ctx);
 
     while (nkshim_pump_events()) {
-        int w, h;
-        nkshim_get_client_size(&w, &h);
-        draw(ctx, (float)w, (float)h);
-        if (g.status == ST_PROCESSING)
-            rmd_zig_step(BATCH);
-        nkshim_render();
+        frame(ctx);
 
         if (g_test_mode) {
             int done, total, errors, i, n;
@@ -688,7 +873,7 @@ rmd_gui_main(void)
                 if (line)
                     fprintf(stdout, "%s\n", line);
             }
-            rc = (errors > 0) ? 3 : 0;
+            rc = g_test_scan_failed ? 2 : (errors > 0) ? 3 : 0;
             break;
         }
     }

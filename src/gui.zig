@@ -4,207 +4,125 @@
 //! lives in C (`nk_shim.c` window plumbing + `gui_nk.c` widget tree); this
 //! file only exports the application logic the C side calls (`rmd_zig_*`)
 //! and the process entry points that forward into `rmd_gui_main()`.
+//!
+//! Threading: every export runs on the UI thread. A started job processes
+//! files on `processor.Job` worker threads, which publish per-file results
+//! lock-free; `rmd_zig_step` drains them into the log on the UI thread, so
+//! the log and all other globals stay single-threaded.
 
 const std = @import("std");
 const decrypter = @import("decrypter.zig");
-const extensions = @import("extensions.zig");
 const key_detect = @import("key_detect.zig");
+const processor = @import("processor.zig");
 const win32_folder_dialog = @import("win32_folder_dialog");
 const Dir = std.Io.Dir;
 
-const LOG_CAP = 1000;
+/// Thread-safe: worker threads allocate their read buffers from it.
+const gpa = std.heap.smp_allocator;
 
-// ─── globals (single UI thread; set up lazily on first export call) ─────
-
-const gpa = std.heap.page_allocator;
-
-var g_threaded: ?*std.Io.Threaded = null;
-var g_io: std.Io = undefined;
-
-fn ensureInit() void {
-    if (g_threaded != null) return;
-    const t = gpa.create(std.Io.Threaded) catch @panic("out of memory");
-    t.* = std.Io.Threaded.init(gpa, .{});
-    g_threaded = t;
-    g_io = t.io();
-}
+var g_threaded: std.Io.Threaded = undefined;
+var g_threaded_ready = false;
 
 fn io() std.Io {
-    ensureInit();
-    return g_io;
+    if (!g_threaded_ready) {
+        g_threaded = .init(gpa, .{});
+        g_threaded_ready = true;
+    }
+    return g_threaded.io();
 }
+
+// ─── log (fixed-capacity ring; oldest entries are evicted) ─────────────────
 
 const LogEntry = struct { msg: [:0]const u8, err: bool };
 
-const Job = struct {
-    files: std.ArrayList([]const u8) = .empty,
-    idx: usize = 0,
-    done: usize = 0,
-    errors: usize = 0,
-    total: usize = 0,
-    input: []u8 = &.{},
-    output: []u8 = &.{},
-    key: []u8 = &.{}, // raw key bytes (empty = no key)
-    decrypt: bool = true,
-    mz: bool = false,
-    ignore_header: bool = false,
-    overwrite: bool = false,
-    clean_output: bool = false,
-    header: [decrypter.DEFAULT_HEADER.len]u8 = decrypter.DEFAULT_HEADER,
+const Log = struct {
+    const cap = 2000;
+    entries: [cap]LogEntry = undefined,
+    head: usize = 0,
+    len: usize = 0,
 
-    fn reset(self: *Job) void {
-        for (self.files.items) |f| gpa.free(f);
-        self.files.clearRetainingCapacity();
-        self.idx = 0;
-        self.done = 0;
-        self.errors = 0;
-        self.total = 0;
-        gpa.free(self.input);
-        gpa.free(self.output);
-        gpa.free(self.key);
-        self.input = &.{};
-        self.output = &.{};
-        self.key = &.{};
+    fn push(l: *Log, msg: []const u8, err: bool) void {
+        const z = gpa.dupeZ(u8, msg) catch return;
+        if (l.len == cap) {
+            gpa.free(l.entries[l.head].msg);
+            l.entries[l.head] = .{ .msg = z, .err = err };
+            l.head = (l.head + 1) % cap;
+        } else {
+            l.entries[(l.head + l.len) % cap] = .{ .msg = z, .err = err };
+            l.len += 1;
+        }
+    }
+
+    fn get(l: *const Log, i: usize) LogEntry {
+        return l.entries[(l.head + i) % cap];
+    }
+
+    fn clear(l: *Log) void {
+        for (0..l.len) |i| gpa.free(l.get(i).msg);
+        l.* = .{};
     }
 };
 
-var g_job: Job = .{};
-var g_log: std.ArrayList(LogEntry) = .empty;
-
-// ─── log ────────────────────────────────────────────────────────────────
+var g_log: Log = .{};
 
 fn logFmt(comptime fmt: []const u8, args: anytype, err: bool) void {
-    const msg = std.fmt.allocPrint(gpa, fmt, args) catch return;
-    defer gpa.free(msg);
-    logSlice(msg, err);
+    var buf: [1024]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch blk: {
+        buf[buf.len - 3 ..].* = "...".*;
+        break :blk &buf;
+    };
+    g_log.push(msg, err);
 }
 
-fn logSlice(msg: []const u8, err: bool) void {
-    if (g_log.items.len >= LOG_CAP) {
-        const old = g_log.orderedRemove(0);
-        gpa.free(old.msg);
+// ─── job state ─────────────────────────────────────────────────────────────
+
+const State = struct {
+    arena: std.heap.ArenaAllocator = .init(gpa),
+    files: []const []const u8 = &.{},
+    in_dir: ?Dir = null,
+    out_dir: ?Dir = null,
+    opts: processor.Options = .{},
+    job: ?*processor.Job = null,
+    /// Results already moved into the log (what the progress bar shows).
+    drained: usize = 0,
+    errors: usize = 0,
+
+    fn reset(s: *State) void {
+        if (s.job) |job| {
+            job.deinit(); // joins the workers
+            gpa.destroy(job);
+        }
+        if (s.in_dir) |d| d.close(io());
+        if (s.out_dir) |d| d.close(io());
+        s.arena.deinit();
+        s.* = .{};
     }
-    const z = gpa.allocSentinel(u8, msg.len, 0) catch return;
-    @memcpy(z[0..msg.len], msg);
-    g_log.append(gpa, .{ .msg = z, .err = err }) catch {};
-}
+};
 
-// ─── file processing ────────────────────────────────────────────────────
-
-fn processFile(input_dir: Dir, output_dir: Dir, path: []const u8) void {
-    const ext_dot = Dir.path.extension(path);
-    if (ext_dot.len == 0) return;
-    const ext = ext_dot[1..];
-    // Per-mode extension gate (encrypt mode must NOT hit the EncryptedExt
-    // check — plain .png/.m4a/.ogg inputs would be silently skipped).
-    if (g_job.decrypt) {
-        if (extensions.EncryptedExt.fromString(ext) == null) return;
-    } else {
-        if (extensions.NormalExt.fromString(ext) == null) return;
-    }
-
-    var in_file = input_dir.openFile(io(), path, .{ .mode = .read_only }) catch {
-        logFmt("  x {s}: open error", .{path}, true);
-        g_job.errors += 1;
-        return;
-    };
-    defer in_file.close(io());
-    const stat = in_file.stat(io()) catch {
-        logFmt("  x {s}: stat error", .{path}, true);
-        g_job.errors += 1;
-        return;
-    };
-    const data = gpa.alloc(u8, stat.size) catch return;
-    defer gpa.free(data);
-    var rdr = in_file.reader(io(), &.{});
-    rdr.interface.readSliceAll(data) catch {
-        logFmt("  x {s}: read error", .{path}, true);
-        g_job.errors += 1;
-        return;
-    };
-
-    const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return;
-    var pbuf: [2048]u8 = undefined;
-    const key = g_job.key;
-
-    if (g_job.decrypt) {
-        if (data.len < decrypter.DEFAULT_HEADER.len) {
-            logFmt("  x {s}: file is smaller than the RPG Maker header", .{path}, true);
-            g_job.errors += 1;
-            return;
-        }
-        if (!g_job.ignore_header and !decrypter.verifyHeaderAgainst(data, g_job.header[0..])) {
-            logFmt("  x {s}: invalid RPG Maker header (enable Ignore header to force)", .{path}, true);
-            g_job.errors += 1;
-            return;
-        }
-        const enc = extensions.EncryptedExt.fromString(ext).?;
-        const out_path = std.fmt.bufPrint(&pbuf, "{s}.{s}", .{ path[0..dot], enc.normalExt() }) catch return;
-        if (Dir.path.dirname(out_path)) |d| {
-            if (d.len > 0) output_dir.createDirPath(io(), d) catch {};
-        }
-        var restored: ?[]u8 = null;
-        defer if (restored) |bytes| gpa.free(bytes);
-        const output_data: []const u8 = if (key.len > 0) blk: {
-            const payload = data[decrypter.DEFAULT_HEADER.len..];
-            for (0..@min(payload.len, key.len)) |i| payload[i] ^= key[i];
-            break :blk payload;
-        } else if (enc.isPng()) blk: {
-            restored = decrypter.DefaultDecrypter.restorePng(data, gpa) catch {
-                logFmt("  x {s}: cannot restore PNG", .{path}, true);
-                g_job.errors += 1;
-                return;
-            };
-            break :blk restored.?;
-        } else {
-            logFmt("  x {s}: no key; audio skipped", .{path}, true);
-            g_job.errors += 1;
-            return;
-        };
-        output_dir.writeFile(io(), .{ .sub_path = out_path, .data = output_data, .flags = .{ .exclusive = !g_job.overwrite } }) catch {
-            logFmt("  x {s}: write error", .{path}, true);
-            g_job.errors += 1;
-            return;
-        };
-        logFmt("  + {s}", .{out_path}, false);
-    } else {
-        const norm = extensions.NormalExt.fromString(ext) orelse return;
-        const out_path = std.fmt.bufPrint(&pbuf, "{s}.{s}", .{ path[0..dot], norm.encryptedExt(g_job.mz) }) catch return;
-        if (Dir.path.dirname(out_path)) |d| {
-            if (d.len > 0) output_dir.createDirPath(io(), d) catch {};
-        }
-        for (0..@min(data.len, key.len)) |i|
-            data[i] ^= key[i];
-        const out_data = std.mem.concat(gpa, u8, &.{ g_job.header[0..], data }) catch return;
-        defer gpa.free(out_data);
-        output_dir.writeFile(io(), .{ .sub_path = out_path, .data = out_data, .flags = .{ .exclusive = !g_job.overwrite } }) catch {
-            logFmt("  x {s}: write error", .{path}, true);
-            g_job.errors += 1;
-            return;
-        };
-        logFmt("  + {s}", .{out_path}, false);
-    }
-}
+var g: State = .{};
 
 // ─── exports called from gui_nk.c ───────────────────────────────────────
 
 export fn rmd_zig_is_dir(path: [*:0]const u8) c_int {
     const p = std.mem.sliceTo(path, 0);
     if (p.len == 0) return 0;
-    var dir = Dir.cwd().openDir(io(), p, .{ .iterate = true }) catch return 0;
+    var dir = Dir.cwd().openDir(io(), p, .{}) catch return 0;
     dir.close(io());
     return 1;
 }
 
+fn copyOut(src: []const u8, out: [*]u8, max: c_int) c_int {
+    if (max <= 0) return 0;
+    const n = @min(src.len, @as(usize, @intCast(max - 1)));
+    @memcpy(out[0..n], src[0..n]);
+    out[n] = 0;
+    return @intCast(n);
+}
+
 export fn rmd_zig_pick_folder(title: [*:0]const u8, out: [*]u8, max: c_int) c_int {
-    const t = std.mem.sliceTo(title, 0);
-    const p = (win32_folder_dialog.selectFolder(gpa, t) catch null) orelse return 0;
+    const p = (win32_folder_dialog.selectFolder(gpa, std.mem.sliceTo(title, 0)) catch null) orelse return 0;
     defer gpa.free(p);
-    const n: usize = @intCast(@max(0, max - 1));
-    const copy = @min(p.len, n);
-    @memcpy(out[0..copy], p[0..copy]);
-    out[copy] = 0;
-    return @intCast(copy);
+    return copyOut(p, out, max);
 }
 
 /// Writes the detected key as a hex string into `out`. Returns its length,
@@ -212,40 +130,20 @@ export fn rmd_zig_pick_folder(title: [*:0]const u8, out: [*]u8, max: c_int) c_in
 export fn rmd_zig_detect_key(input: [*:0]const u8, out: [*]u8, max: c_int) c_int {
     const ip = std.mem.sliceTo(input, 0);
     if (ip.len == 0) return 0;
-    var id = Dir.cwd().openDir(io(), ip, .{ .iterate = true, .access_sub_paths = true }) catch {
+    var dir = Dir.cwd().openDir(io(), ip, .{ .iterate = true }) catch {
         logFmt("  x cannot open input folder: {s}", .{ip}, true);
         return 0;
     };
-    defer id.close(io());
-
-    const k = (key_detect.detectFromInput(io(), gpa, id) catch null) orelse return 0;
-    defer gpa.free(k);
-
-    // detectFromInput yields a hex string (System.json / JS files) or raw
-    // key bytes (PNG-derived). Normalize to hex for the UI field.
-    var hex_buf: [64]u8 = undefined;
-    const hex: []const u8 = if (key_detect.validateKeyHex(k))
-        k
-    else blk: {
-        if (k.len * 2 > hex_buf.len) return 0;
-        const charset = "0123456789abcdef";
-        for (k, 0..) |b, i| {
-            hex_buf[i * 2] = charset[b >> 4];
-            hex_buf[i * 2 + 1] = charset[b & 15];
-        }
-        break :blk hex_buf[0 .. k.len * 2];
-    };
-
-    const n: usize = @intCast(@max(0, max - 1));
-    const copy = @min(hex.len, n);
-    @memcpy(out[0..copy], hex[0..copy]);
-    out[copy] = 0;
-    logFmt("  + key detected: {s}", .{hex[0..copy]}, false);
-    return @intCast(copy);
+    defer dir.close(io());
+    const found = (key_detect.detect(io(), gpa, dir) catch null) orelse return 0;
+    const hex = found.hex();
+    logFmt("  + key detected ({s}): {s}", .{ found.source.describe(), &hex }, false);
+    return copyOut(&hex, out, max);
 }
 
-/// Scans `input` for processable files and stores the job. Returns the
-/// number of files found, or <= 0 on failure.
+/// Validates the settings, discovers the files to process and prepares the
+/// output folder. Returns the number of files found, 0 when there are none,
+/// or -1 on error (details are in the log).
 export fn rmd_zig_scan(
     input: [*:0]const u8,
     output: [*:0]const u8,
@@ -257,163 +155,170 @@ export fn rmd_zig_scan(
     overwrite: c_int,
     clean_output: c_int,
 ) c_int {
-    const ip = std.mem.sliceTo(input, 0);
-    const op = std.mem.sliceTo(output, 0);
-    const kh = std.mem.sliceTo(key_hex, 0);
-    const hh = std.mem.sliceTo(header_hex, 0);
+    g.reset();
+    g_log.clear();
+    return scan(
+        std.mem.sliceTo(input, 0),
+        std.mem.sliceTo(output, 0),
+        std.mem.sliceTo(key_hex, 0),
+        std.mem.sliceTo(header_hex, 0),
+        decrypt != 0,
+        mz != 0,
+        ignore_header != 0,
+        overwrite != 0,
+        clean_output != 0,
+    ) catch |err| {
+        logFmt("  x {s}", .{processor.describeError(err)}, true);
+        g.reset();
+        return -1;
+    };
+}
 
-    g_job.reset();
-    g_log.clearRetainingCapacity();
-
-    // Convert the UI's hex key to raw bytes (empty = no key).
+fn scan(ip: []const u8, op_opt: []const u8, kh: []const u8, hh: []const u8, decrypt: bool, mz: bool, ignore_header: bool, overwrite: bool, clean_output: bool) !c_int {
+    var opts: processor.Options = .{
+        .mode = if (decrypt) .decrypt else .encrypt,
+        .mz = mz,
+        .verify_header = !ignore_header,
+        .overwrite = overwrite,
+    };
     if (kh.len > 0) {
-        if (!key_detect.validateKeyHex(kh)) {
-            logFmt("  x invalid key: need an even number of hex chars (got {d})", .{kh.len}, true);
-            return -1;
-        }
-        g_job.key = key_detect.hexKeyToBytes(kh, gpa) catch {
-            logFmt("  x invalid key characters", .{}, true);
+        opts.key = decrypter.parseHex16(kh) orelse {
+            logFmt("  x invalid key: need exactly 32 hex characters (got {d})", .{kh.len}, true);
             return -1;
         };
     }
+    opts.header = decrypter.parseHex16(hh) orelse {
+        logFmt("  x fake header must be exactly 32 hexadecimal characters", .{}, true);
+        return -1;
+    };
 
-    var id = Dir.cwd().openDir(io(), ip, .{ .iterate = true, .access_sub_paths = true }) catch {
+    const in_dir = Dir.cwd().openDir(io(), ip, .{ .iterate = true }) catch {
         logFmt("  x cannot open input folder: {s}", .{ip}, true);
         return -1;
     };
-    defer id.close(io());
+    g.in_dir = in_dir;
+    const op = if (op_opt.len > 0) op_opt else ip;
 
-    g_job.decrypt = decrypt != 0;
-    g_job.mz = mz != 0;
-    g_job.ignore_header = ignore_header != 0;
-    g_job.overwrite = overwrite != 0;
-    g_job.clean_output = clean_output != 0;
-    if (!key_detect.validateKeyHex(hh)) {
-        logFmt("  x fake header must be exactly 32 hexadecimal characters", .{}, true);
-        return -1;
-    }
-    const parsed_header = key_detect.hexKeyToBytes(hh, gpa) catch return -1;
-    defer gpa.free(parsed_header);
-    @memcpy(g_job.header[0..], parsed_header);
-    g_job.input = gpa.dupe(u8, ip) catch return -1;
-    g_job.output = gpa.dupe(u8, if (op.len > 0) op else ip) catch return -1;
-
-    if (g_job.clean_output) {
-        if (std.mem.eql(u8, g_job.input, g_job.output)) {
-            logFmt("  x refusing to clean an output folder that is also the input folder", .{}, true);
-            return -1;
-        }
-        Dir.cwd().deleteTree(io(), g_job.output) catch {
-            logFmt("  x could not clean output folder: {s}", .{g_job.output}, true);
-            return -1;
-        };
-    }
-
-    if (g_job.key.len == 0) {
-        const detected = key_detect.detectFromInput(io(), gpa, id) catch null;
-        if (detected) |found| {
-            defer gpa.free(found);
-            g_job.key = if (key_detect.validateKeyHex(found))
-                key_detect.hexKeyToBytes(found, gpa) catch return -1
-            else
-                gpa.dupe(u8, found) catch return -1;
-            logFmt("  + key auto-detected", .{}, false);
-        } else if (!g_job.decrypt) {
+    if (opts.key == null) {
+        if (try key_detect.detect(io(), gpa, in_dir)) |found| {
+            opts.key = found.key;
+            logFmt("  + key auto-detected ({s})", .{found.source.describe()}, false);
+        } else if (opts.mode == .encrypt) {
             logFmt("  x encryption needs a key; auto-detection failed", .{}, true);
             return -1;
+        } else {
+            logFmt("  ! no key found - PNGs will be restored, audio cannot be decrypted", .{}, true);
         }
     }
 
-    var walker = id.walk(gpa) catch return -1;
-    defer walker.deinit();
-    while (true) {
-        const entry = walker.next(io()) catch break orelse break;
-        if (entry.kind != .file) continue;
-        const ed = Dir.path.extension(entry.basename);
-        if (ed.len == 0) continue;
-        if (g_job.decrypt) {
-            if (extensions.EncryptedExt.fromString(ed[1..]) != null)
-                g_job.files.append(gpa, gpa.dupe(u8, entry.path) catch continue) catch {};
-        } else {
-            if (extensions.NormalExt.fromString(ed[1..]) != null)
-                g_job.files.append(gpa, gpa.dupe(u8, entry.path) catch continue) catch {};
-        }
-    }
-    g_job.total = g_job.files.items.len;
-    if (g_job.total == 0) {
+    const plan = try processor.plan(io(), g.arena.allocator(), in_dir, opts.mode);
+    if (plan.walk_errors > 0) logFmt("  ! {d} folder(s) could not be read", .{plan.walk_errors}, true);
+    if (plan.files.len == 0) {
         logFmt("  x no matching files found in that folder", .{}, true);
         return 0;
     }
 
-    Dir.cwd().createDirPath(io(), g_job.output) catch {
-        logFmt("  x could not create output folder: {s}", .{g_job.output}, true);
+    if (clean_output) {
+        processor.checkCleanTarget(io(), gpa, ip, op) catch |err| {
+            if (err == error.OutputOverlapsInput) {
+                logFmt("  x refusing to clean: the output folder overlaps the input folder", .{}, true);
+            } else {
+                logFmt("  x cannot verify the output folder: {s}", .{processor.describeError(err)}, true);
+            }
+            return -1;
+        };
+        Dir.cwd().deleteTree(io(), op) catch {
+            logFmt("  x could not clean output folder: {s}", .{op}, true);
+            return -1;
+        };
+    }
+    Dir.cwd().createDirPath(io(), op) catch {
+        logFmt("  x could not create output folder: {s}", .{op}, true);
         return -1;
     };
-    logFmt("  -> found {d} files", .{g_job.total}, false);
-    return @intCast(g_job.total);
+    const out_dir = Dir.cwd().openDir(io(), op, .{}) catch {
+        logFmt("  x cannot open output folder: {s}", .{op}, true);
+        return -1;
+    };
+    g.out_dir = out_dir;
+    processor.createOutputDirs(io(), out_dir, plan);
+
+    g.files = plan.files;
+    g.opts = opts;
+    logFmt("  -> found {d} files", .{plan.files.len}, false);
+    return @intCast(plan.files.len);
 }
 
-/// Processes up to `batch` files of the current job (called once per frame
-/// while the UI reports "processing").
+/// Called once per frame while the UI is processing: starts the job on the
+/// first call, then moves finished results into the log. `batch` is kept
+/// for ABI compatibility; work now runs on background threads.
 export fn rmd_zig_step(batch: c_int) void {
-    const start = g_job.idx;
-    const end = @min(start + @as(usize, @intCast(@max(1, batch))), g_job.files.items.len);
-    if (start >= end) return;
-
-    var od = Dir.cwd().openDir(io(), g_job.output, .{}) catch {
-        logFmt("  x cannot open output folder: {s}", .{g_job.output}, true);
-        g_job.idx = g_job.files.items.len;
-        g_job.done = g_job.total;
-        return;
+    _ = batch;
+    if (g.drained >= g.files.len) return;
+    const job = g.job orelse start: {
+        const job = gpa.create(processor.Job) catch return failAll("out of memory");
+        job.* = processor.Job.init(io(), gpa, g.in_dir.?, g.out_dir.?, g.files, g.opts) catch {
+            gpa.destroy(job);
+            return failAll("out of memory");
+        };
+        g.job = job;
+        job.start(processor.defaultJobs());
+        break :start job;
     };
-    defer od.close(io());
-    var id = Dir.cwd().openDir(io(), g_job.input, .{ .iterate = true, .access_sub_paths = true }) catch {
-        logFmt("  x cannot open input folder: {s}", .{g_job.input}, true);
-        g_job.idx = g_job.files.items.len;
-        g_job.done = g_job.total;
-        return;
-    };
-    defer id.close(io());
 
-    for (g_job.files.items[start..end]) |fp| {
-        processFile(id, od, fp);
-        g_job.done += 1;
+    while (g.drained < g.files.len) : (g.drained += 1) {
+        const path = g.files[g.drained];
+        const res = job.result(g.drained) orelse break;
+        if (res) {
+            var buf: [processor.max_rel_path]u8 = undefined;
+            const target = processor.classify(path, g.opts.mode, g.opts.mz).?;
+            logFmt("  + {s}", .{processor.outputPath(&buf, path, target.out_ext) catch path}, false);
+        } else |err| {
+            g.errors += 1;
+            logFmt("  x {s}: {s}", .{ path, processor.describeError(err) }, true);
+        }
     }
-    g_job.idx = end;
 
-    if (g_job.done >= g_job.total) {
-        if (g_job.errors > 0) {
-            logFmt("  done - {d} files, {d} errors", .{ g_job.done, g_job.errors }, true);
+    if (g.drained == g.files.len) {
+        job.join();
+        if (g.errors > 0) {
+            logFmt("  done - {d} files, {d} errors", .{ g.drained, g.errors }, true);
         } else {
-            logFmt("  done - {d} files processed", .{g_job.done}, false);
+            logFmt("  done - {d} files processed", .{g.drained}, false);
         }
     }
 }
 
+fn failAll(reason: []const u8) void {
+    logFmt("  x {s}", .{reason}, true);
+    g.errors = g.files.len;
+    g.drained = g.files.len;
+}
+
 export fn rmd_zig_progress(done: *c_int, total: *c_int, errors: *c_int) void {
-    done.* = @intCast(g_job.done);
-    total.* = @intCast(g_job.total);
-    errors.* = @intCast(g_job.errors);
+    done.* = @intCast(g.drained);
+    total.* = @intCast(g.files.len);
+    errors.* = @intCast(g.errors);
 }
 
 export fn rmd_zig_log(msg: [*:0]const u8, is_err: c_int) void {
-    logSlice(std.mem.sliceTo(msg, 0), is_err != 0);
+    g_log.push(std.mem.sliceTo(msg, 0), is_err != 0);
 }
 
 export fn rmd_zig_log_count() c_int {
-    return @intCast(g_log.items.len);
+    return @intCast(g_log.len);
 }
 
+/// The returned string stays valid until the next log call.
 export fn rmd_zig_log_get(i: c_int, is_err: *c_int) ?[*:0]const u8 {
-    if (i < 0 or i >= g_log.items.len) return null;
-    const e = g_log.items[@intCast(i)];
+    if (i < 0 or i >= g_log.len) return null;
+    const e = g_log.get(@intCast(i));
     is_err.* = @intFromBool(e.err);
     return e.msg.ptr;
 }
 
 export fn rmd_zig_log_clear() void {
-    for (g_log.items) |e| gpa.free(e.msg);
-    g_log.clearRetainingCapacity();
+    g_log.clear();
 }
 
 // ─── entry points (UI lives in gui_nk.c) ────────────────────────────────

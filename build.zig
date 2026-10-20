@@ -62,4 +62,36 @@ pub fn build(b: *std.Build) void {
     const run_exe_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
+
+    // --- Benchmarks (build with -Doptimize=ReleaseFast for real numbers) ---
+    const core = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addBench(b, core, target, optimize, "bench", "bench/micro.zig", "CPU microbenchmarks (optional arg: game dir)");
+    addBench(b, core, target, optimize, "bench-io", "bench/io_strategies.zig", "File-system strategy bench (args: game dir, scratch dir, [reps])");
+}
+
+fn addBench(
+    b: *std.Build,
+    core: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    step_name: []const u8,
+    source: []const u8,
+    description: []const u8,
+) void {
+    const exe = b.addExecutable(.{
+        .name = step_name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(source),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "rmdecrypt", .module = core }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    if (b.args) |args| run.addArgs(args);
+    b.step(step_name, description).dependOn(&run.step);
 }

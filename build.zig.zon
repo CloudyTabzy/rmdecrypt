@@ -1,6 +1,6 @@
 .{
     .name = .rmdecrypt,
-    .version = "1.0.0",
+    .version = "1.2.0",
     .fingerprint = 0x68a1460ecd7f1143,
     .minimum_zig_version = "0.16.0",
     .paths = .{
