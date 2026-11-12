@@ -6,7 +6,7 @@ const decrypter = @import("decrypter.zig");
 const key_detect = @import("key_detect.zig");
 const processor = @import("processor.zig");
 
-const VERSION = "1.5.0";
+const VERSION = @import("build_options").version;
 
 /// Exit codes: 0 = success, 1 = runtime failure (including any file that
 /// could not be processed), 2 = invalid command line.

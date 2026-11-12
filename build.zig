@@ -15,6 +15,22 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // Single source of truth for the version string: the .version field of
+    // build.zig.zon, read out of the manifest text at compile time. The CLI
+    // gets it via the build_options module (also picked up by the test
+    // step, which reuses exe.root_module); the GUI C code via -DRMD_VERSION.
+    const version = blk: {
+        const zon = @embedFile("build.zig.zon");
+        const marker = ".version = \"";
+        const at = std.mem.indexOf(u8, zon, marker) orelse break :blk "0.0.0-dev";
+        const rest = zon[at + marker.len ..];
+        const end = std.mem.indexOfScalar(u8, rest, '"') orelse break :blk "0.0.0-dev";
+        break :blk rest[0..end];
+    };
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+    exe.root_module.addOptions("build_options", build_options);
+
     const run_step = b.step("run", "Run CLI");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
@@ -38,6 +54,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     gui.root_module.addIncludePath(b.path("vendor/nuklear"));
+    gui.root_module.addCMacro("RMD_VERSION", b.fmt("\"{s}\"", .{version}));
     gui.root_module.addCSourceFile(.{ .file = b.path("src/nk_shim.c") });
     gui.root_module.addCSourceFile(.{ .file = b.path("src/gui_nk.c") });
     gui.root_module.addWin32ResourceFile(.{ .file = b.path("resources/app.rc") });

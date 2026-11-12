@@ -68,7 +68,12 @@ extern void rmd_zig_log_clear(void);
 
 /* ── UI state ─────────────────────────────────────────────────────────── */
 
-#define VERSION  "1.5.0"
+/* Version string injected by build.zig (-DRMD_VERSION="x.y.z"); keep the
+ * build.zig.zon .version field as the single source of truth. */
+#ifndef RMD_VERSION
+#define RMD_VERSION "0.0.0-dev"
+#endif
+#define VERSION RMD_VERSION
 #define BUF_LEN  1024
 #define BATCH    15
 
@@ -404,7 +409,7 @@ field_row(struct nk_context *ctx, const char *label, char *buf, int len,
           const char *button, float button_w, const char *tip,
           nk_plugin_filter filter)
 {
-    int clicked = 0, hovered;
+    int clicked = 0;
     nk_layout_row_template_begin(ctx, S(ROW_H));
     nk_layout_row_template_push_static(ctx, S(LABEL_W));
     nk_layout_row_template_push_dynamic(ctx);
@@ -413,9 +418,12 @@ field_row(struct nk_context *ctx, const char *label, char *buf, int len,
     nk_label(ctx, label, NK_TEXT_LEFT);
     nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, buf, len, filter);
     if (button) {
-        hovered = tip && nk_widget_is_hovered(ctx);
         clicked = nk_button_label(ctx, button);
-        if (hovered) nk_tooltip(ctx, tip);
+        /* the tooltip describes the button, so test the button's own hover
+         * state (nk_widget_is_hovered() peeks the NEXT slot, not the last
+         * widget - querying it anywhere around the button is a trap) */
+        if (tip && (ctx->last_widget_state & NK_WIDGET_STATE_HOVER))
+            nk_tooltip(ctx, tip);
     }
     return clicked;
 }
@@ -568,7 +576,7 @@ options_card(struct nk_context *ctx)
 static void
 header_row(struct nk_context *ctx)
 {
-    int p, hovered;
+    int p;
     nk_layout_row_template_begin(ctx, S(HEADER_H));
     nk_layout_row_template_push_static(ctx, S(ICON_W) + S(4));
     nk_layout_row_template_push_static(ctx, text_width(f_title, "rmdecrypt") + S(4));
@@ -585,14 +593,15 @@ header_row(struct nk_context *ctx)
 
     /* square icon button; the template above keeps it fully inside the
      * row, so all four rounded corners are drawn */
-    hovered = nk_widget_is_hovered(ctx);
     p = push_font(ctx, f_icons);
     if (nk_button_label(ctx, ico(g.dark ? ICON_SUN : ICON_MOON))) {
         g.dark = !g.dark;
         set_theme(ctx, g.dark);
     }
     if (p) nk_style_pop_font(ctx);
-    if (hovered)
+    /* the tip describes the toggle; test the button's own hover state
+     * (see the note in field_row about the nk_widget_is_hovered trap) */
+    if (ctx->last_widget_state & NK_WIDGET_STATE_HOVER)
         nk_tooltip(ctx, g.dark ? "Switch to light theme" : "Switch to dark theme");
 }
 

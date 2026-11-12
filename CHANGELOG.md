@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1] - 2026-11-12
+
+Point release: two code-quality fixes found while branding.
+
+### Fixed
+
+- **Tooltip hover ownership.** `field_row` and the theme toggle queried
+  hover with `nk_widget_is_hovered()`, which peeks the *next* layout slot,
+  not the widget it belongs to - an accident of call ordering decided
+  which rectangle actually triggered the tip. Both sites now test the
+  button's own `ctx->last_widget_state & NK_WIDGET_STATE_HOVER` right
+  after drawing it: hover belongs to the button the tooltip describes,
+  at any position inside it. Verified with posted-message probes on the
+  toggle (main window) and the Detect button (inside a group card).
+
+### Changed
+
+- **Single-sourced version string.** The version now lives only in
+  `build.zig.zon`'s `.version`; `build.zig` reads it from the manifest
+  text and injects it into the CLI via a `build_options` module and into
+  the GUI C code via `-DRMD_VERSION`, replacing three hand-edited
+  literals per release (a real hazard: they had already drifted once).
+
 ## [1.5.0] - 2026-11-12
 
 GUI polish release: the tooltips behave, the window has a face, and the
