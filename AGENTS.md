@@ -115,8 +115,8 @@ logged. The log is a fixed ring buffer (`Log.cap`); a string from
 must stay on the UI thread.
 
 ### Nuklear GUI (C UI / Zig logic split)
-The GUI follows the same architecture as the sibling `btworkshop_zig`
-project: **all Nuklear widget code lives in C**, Zig only exports
+The GUI follows the C-UI / Zig-logic split of this project's earlier
+native-GUI sibling: **all Nuklear widget code lives in C**, Zig only exports
 application logic.  This avoids the entire class of `@cImport` ABI issues
 (struct‑by‑value calls into the single‑header library) and keeps the UI
 code byte‑identical to upstream Nuklear demo patterns.

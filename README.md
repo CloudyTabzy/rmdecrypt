@@ -123,8 +123,8 @@ RPG Maker's built-in encryption is a simple XOR scheme, not a strong cipher:
 
 ## Benchmark
 
-> Windows 11, 16 logical CPUs, NVMe SSD, Windows Defender real-time protection
-> on. Input: a real MZ game, 961 encrypted files (28.7 MB; median file 5.9 KB,
+> Windows 11, NVMe SSD, Windows Defender real-time protection on. Input: a
+> real MZ game, 961 encrypted files (28.7 MB; median file 5.9 KB,
 > 530 files in one directory) inside a 1,333-entry tree. `-Doptimize=ReleaseFast`,
 > Node.js 25.8. 25 interleaved runs per tool (round-robin, fresh output
 > directory each run); **all four tools produced byte-identical output trees**.

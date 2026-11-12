@@ -1,8 +1,9 @@
 /* gui_nk.c — Nuklear UI for rmdecrypt.
  *
- * All Nuklear widget code lives here in C (the same architecture as the
- * btworkshop_zig project): window/D3D11/frame plumbing is in nk_shim.c,
- * application logic is exported from gui.zig as rmd_zig_* functions.
+ * All Nuklear widget code lives here in C (the same architecture as this
+ * project's earlier native-GUI sibling): window/D3D11/frame plumbing is in
+ * nk_shim.c, application logic is exported from gui.zig as rmd_zig_*
+ * functions.
  *
  * This TU sees Nuklear declarations only — the implementation lives in
  * nk_shim.c. The feature defines MUST match nk_shim.c exactly.
@@ -785,7 +786,7 @@ draw(struct nk_context *ctx, float win_w, float win_h)
 
 /* ── entry ────────────────────────────────────────────────────────────── */
 
-/* Headless self-test (mirrors btworkshop's --test mode): set
+/* Headless self-test: set
  * RMD_TEST_INPUT (and optionally RMD_TEST_OUTPUT) to fill the fields,
  * auto-detect the key, run the job to completion, dump the log to
  * stdout and exit. Exit code 0 = success, 2 = the job could not start

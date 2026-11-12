@@ -1,6 +1,6 @@
 //! rmdecrypt GUI — Zig logic layer.
 //!
-//! Following the btworkshop_zig architecture: all Nuklear/Win32 UI code
+//! C-UI / Zig-logic architecture: all Nuklear/Win32 UI code
 //! lives in C (`nk_shim.c` window plumbing + `gui_nk.c` widget tree); this
 //! file only exports the application logic the C side calls (`rmd_zig_*`)
 //! and the process entry points that forward into `rmd_gui_main()`.
