@@ -158,8 +158,14 @@ neat:
   `log_sy`, not `nk_group_set_scroll()`.
 - Key/Options sit side by side above `WIDE_MIN`, stacked below it.
 
-Vendored Nuklear patches (search `rmdecrypt patch` in `nuklear.h`; re-apply
-if Nuklear is ever updated):
+Vendored Nuklear: **v4.13.4** (upstream tag `f101764`, bumped from 4.13.3 —
+upstream never updated its own header VERSION comment). All fork changes are
+captured in `vendor/nuklear/rmdecrypt-nuklear.patch` (apply with
+`git apply` from inside `vendor/nuklear/` onto a pristine upstream
+`nuklear.h`; keep it LF, the header is LF). Search `rmdecrypt patch` in
+`nuklear.h` for the individual sites; on the next update, regenerate the
+patch pre-bump, re-apply onto the new header, rebuild + run the GUI test
+scripts. Patch inventory:
 - `style.window.group_background` — card background for group panels.
 - `nk_rgb_factor` fades alpha instead of darkening RGB (disabled widgets
   recede on the light theme too).
