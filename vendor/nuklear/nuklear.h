@@ -20456,6 +20456,12 @@ nk_panel_end(struct nk_context *ctx)
         if (layout->at_y < (layout->bounds.y + layout->bounds.h))
             layout->bounds.h = layout->at_y - layout->bounds.y;
 
+        /* rmdecrypt patch: tooltips get one rounded background (pushed in
+         * nk_tooltip_begin_offset) - skip these square edge strips, which
+         * moreover use menu_padding values while the tooltip box is inset
+         * by popup_padding, leaving tabs over the corner arcs and unpainted
+         * slivers beside them. Height fitting above still runs. */
+        if (layout->type != NK_PANEL_TOOLTIP) {
         /* fill top empty space */
         empty_space.x = window->bounds.x;
         empty_space.y = layout->bounds.y;
@@ -20478,6 +20484,7 @@ nk_panel_end(struct nk_context *ctx)
         if (*layout->offset_y == 0 && !(layout->flags & NK_WINDOW_NO_SCROLLBAR))
             empty_space.w += scrollbar_size.x;
         nk_fill_rect(out, empty_space, 0, style->window.background);
+        }
 
         /* fill bottom empty space */
         if (layout->footer_height > 0) {
@@ -22284,8 +22291,12 @@ nk_panel_layout(const struct nk_context *ctx, struct nk_window *win,
     else layout->row.height = height + item_spacing.y;
 
     layout->row.item_offset = 0;
-    if (layout->flags & NK_WINDOW_DYNAMIC) {
-        /* draw background for dynamic panels */
+    if (layout->flags & NK_WINDOW_DYNAMIC && layout->type != NK_PANEL_TOOLTIP) {
+        /* rmdecrypt patch: the TOOLTIP check excludes tooltips - they paint
+         * one rounded background in nk_tooltip_begin_offset instead; this
+         * full-width square fill (and its 1px top overhang) would stick out
+         * of the rounded border's corner arcs over the UI underneath.
+         * Draw background for dynamic panels */
         struct nk_rect background;
         background.x = win->bounds.x;
         background.w = win->bounds.w;
@@ -30936,7 +30947,17 @@ nk_tooltip_begin_offset(struct nk_context *ctx, float width, enum nk_tooltip_pos
         return 0;
 
     w = nk_iceilf(width);
-    h = (int)NK_MAX(win->layout->row.min_height, ctx->style.font->height+2*ctx->style.window.padding.y);
+    /* rmdecrypt patch: the tooltip box is sized from popup_padding (the
+     * padding the popup panel actually applies) instead of the main window
+     * padding, which stock multiplies inside the row AND inside the popup
+     * panel, making the box fat and right-heavy. Final dynamic box height =
+     * row start inset (spacing.y/2) + row (font + 2*popup_padding.y) +
+     * trailing row spacing (spacing.y) + top/bottom border = the expression
+     * below; keep h equal to it for placement, the clamp and the rounded
+     * background fill. */
+    h = (int)(ctx->style.font->height + 2*ctx->style.window.popup_padding.y
+              + 1.5f*ctx->style.window.spacing.y
+              + 2*ctx->style.window.popup_border);
 
     /* Default origin is top left, plus user offset */
     x = nk_ifloorf(in->mouse.pos.x + 1) - (int)win->layout->clip.x + (int)offset.x;
@@ -30981,6 +31002,22 @@ nk_tooltip_begin_offset(struct nk_context *ctx, float width, enum nk_tooltip_pos
         NK_ASSERT(0 && "Invalid tooltip position");
     }
 
+    /* rmdecrypt patch: keep the tooltip fully visible. x/y are local to the
+     * parent panel's visible clip rect (nk_popup_begin adds clip.x/clip.y
+     * back), and stock Nuklear happily extends the popup past the window
+     * edge where the HWND clips it off. Nudge it back inside, shifting as
+     * little as needed so it stays anchored near the cursor; if the tooltip
+     * is wider or taller than the panel, pin it to the near edge instead. */
+    {
+        float lx = (float)x, ly = (float)y;
+        float rx = win->layout->clip.w - (float)w;
+        float ry = win->layout->clip.h - (float)h;
+        if (lx > rx) lx = (rx > 0.0f) ? rx : 0.0f;
+        if (ly > ry) ly = (ry > 0.0f) ? ry : 0.0f;
+        x = nk_ifloorf(NK_MAX(lx, 0.0f));
+        y = nk_ifloorf(NK_MAX(ly, 0.0f));
+    }
+
     bounds.x = (float)x;
     bounds.y = (float)y;
     bounds.w = (float)w;
@@ -30989,6 +31026,44 @@ nk_tooltip_begin_offset(struct nk_context *ctx, float width, enum nk_tooltip_pos
     ret = nk_popup_begin(ctx, NK_POPUP_DYNAMIC,
         "__##Tooltip##__", NK_WINDOW_NO_SCROLLBAR|NK_WINDOW_BORDER, bounds);
     if (ret) win->layout->flags &= ~(nk_flags)NK_WINDOW_ROM;
+    if (ret) {
+        struct nk_rect tt_bg, tt_clip, tt_save;
+        /* rmdecrypt patch: the dynamic box is row height + trailing row
+         * spacing; start the row at spacing.y/2 down (stock would start it
+         * at the full popup_padding.y top inset) so the text sits vertically
+         * centered in the final box instead of riding high. */
+        ctx->current->layout->row.height = ctx->style.window.spacing.y * 0.5f;
+        /* rmdecrypt patch: paint the tooltip's background as ONE rounded
+         * rect matching the border stroke. Dynamic panels never draw a
+         * rounded body (nk_panel_begin skips it); upstream paints the box
+         * with square fills instead (per-row in nk_panel_layout, edge
+         * strips in nk_panel_end - both skipped for TOOLTIP there), which
+         * stick out of style.window.rounding's corner arcs as flat tabs
+         * over whatever the tooltip floats on. This fill is pushed first,
+         * so glyphs and the stroke draw over it.
+         * The popup's scissor is already the CONTENT rect (inset by
+         * panel_padding + border), so it must be widened to the full box
+         * for this fill and restored afterwards - otherwise the background
+         * never reaches the border and the widgets behind show through a
+         * sliver at each end.
+         * NOTE: applies to all tooltip panels; hand-built multi-row
+         * nk_tooltip_begin() content must draw its own background. */
+        tt_bg = ctx->current->bounds;
+        tt_bg.h = (float)h;
+        tt_save = ctx->current->buffer.clip;
+        nk_unify(&tt_clip, &win->layout->clip, tt_bg.x, tt_bg.y,
+            tt_bg.x + tt_bg.w, tt_bg.y + tt_bg.h);
+        /* Clipping in Nuklear is a *scissor command in the stream* (replayed
+         * by nk_convert), not buffer state at push time - so widening means
+         * pushing a real scissor command, and restoring pushes the content
+         * rect back. Re-baseline buffer.clip first because nk_push_scissor
+         * only ever intersects (shrinks). */
+        ctx->current->buffer.clip = tt_clip;
+        nk_push_scissor(&ctx->current->buffer, tt_clip);
+        nk_fill_rect(&ctx->current->buffer, tt_bg,
+            ctx->style.window.rounding, ctx->style.window.background);
+        nk_push_scissor(&ctx->current->buffer, tt_save);
+    }
     win->popup.type = NK_PANEL_TOOLTIP;
     ctx->current->layout->type = NK_PANEL_TOOLTIP;
     return ret;
@@ -31063,13 +31138,17 @@ nk_tooltip_offset(struct nk_context *ctx, const char *text, enum nk_tooltip_pos 
 
     /* fetch configuration data */
     style = &ctx->style;
-    padding = style->window.padding;
+    padding = style->window.popup_padding; /* rmdecrypt patch: compact tooltip */
 
-    /* calculate size of the text and tooltip */
+    /* calculate size of the text and tooltip. The popup panel insets the
+     * content by popup_padding.x + popup_border per side, so exactly that
+     * much added to the glyph width lands the text with symmetric margins;
+     * vertically the row is the whole box (the panel top inset is zeroed in
+     * nk_tooltip_begin_offset) and nk_text centers the font in it. */
     text_len = nk_strlen(text);
     text_width = style->font->width(style->font->userdata,
                     style->font->height, text, text_len);
-    text_width += (4 * padding.x);
+    text_width += 2 * (padding.x + style->window.popup_border);
     text_height = (style->font->height + 2 * padding.y);
 
     /* execute tooltip and fill with text */

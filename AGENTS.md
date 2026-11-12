@@ -169,6 +169,23 @@ if Nuklear is ever updated):
   draws (the stock code re-centres it on the stock thumb, so any geometry
   tweak outside this function breaks dragging), track click pages, wheel
   ≥ 3 text lines per notch. Horizontal scrollbars are stock.
+- `nk_tooltip_begin_offset` — clamps the tooltip into the parent panel's
+  visible clip rect. Stock Nuklear anchors it at the cursor and lets the
+  window edge cut it off; the patch nudges it back inside the least amount
+  needed, so it stays near the cursor but is always fully visible.
+- `nk_tooltip_begin_offset` / `nk_tooltip_offset` / dynamic-fill guards —
+  compact, correctly-shaped tooltip box. Stock sizes from the main window's
+  padding (doubled by the popup panel's own inset → fat box) and, because
+  dynamic panels never get the rounded body fill, paints the box with
+  square fills (per-row in `nk_panel_layout`, edge strips in
+  `nk_panel_end` - both skipped for `NK_PANEL_TOOLTIP` by rmdecrypt guards)
+  that stick out of `window.rounding`'s corner arcs and leave scissor
+  slivers where content behind shows through. The patch draws ONE rounded
+  background in `nk_tooltip_begin_offset` (with scissor commands pushed
+  around it - clipping is stream state in Nuklear, assigning
+  `buffer.clip` alone does nothing) and sizes everything from
+  `popup_padding`, which `gui_nk.c`'s `TT_PAD_X`/`TT_PAD_Y` set
+  DPI-scaled. Tooltips are this app's only popups.
 The patched header must stay shared by `nk_shim.c` and `gui_nk.c`.
 
 Live resize (`nk_shim.c`): Windows runs a *modal* move/size loop inside

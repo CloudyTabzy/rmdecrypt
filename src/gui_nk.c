@@ -146,6 +146,9 @@ static float g_scale = 1.0f;
 #define GAP        10   /* widget spacing, x and y */
 #define PAD_X      18   /* main window padding */
 #define PAD_Y      14
+#define TT_PAD_X   12   /* tooltip box padding (popup_padding; tooltips are
+                         * the only popup this app creates — see AGENTS.md) */
+#define TT_PAD_Y    5
 #define CARD_PAD_X 14   /* inside cards */
 #define CARD_PAD_Y 12
 #define ROW_H      30   /* fields and buttons */
@@ -183,6 +186,7 @@ apply_style_tweaks(struct nk_context *ctx, struct nk_color border_col)
     st->window.spacing = nk_vec2(S(GAP), S(GAP));
     st->window.padding = nk_vec2(S(PAD_X), S(PAD_Y));
     st->window.group_padding = nk_vec2(S(CARD_PAD_X), S(CARD_PAD_Y));
+    st->window.popup_padding = nk_vec2(S(TT_PAD_X), S(TT_PAD_Y)); /* rmdecrypt patch: tooltip box knob */
     st->window.rounding = S(8);
     st->window.group_border = 1.0f;
     st->window.group_border_color = border_col;
