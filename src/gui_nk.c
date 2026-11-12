@@ -68,7 +68,7 @@ extern void rmd_zig_log_clear(void);
 
 /* ── UI state ─────────────────────────────────────────────────────────── */
 
-#define VERSION  "1.2.0"
+#define VERSION  "1.5.0"
 #define BUF_LEN  1024
 #define BATCH    15
 

@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-11-12
+
+GUI polish release: the tooltips behave, the window has a face, and the
+vendored GUI library is current.
+
+### Added
+
+- **App icon.** A multi-resolution `rmdecrypt.ico` (16–256 px, the slime
+  bandit emblem) is compiled into the GUI executable via
+  `resources/app.rc` + `addWin32ResourceFile`; the window class is now a
+  `WNDCLASSEX` that loads it for the title bar / taskbar (`hIcon`) and a
+  true 16 px `hIconSm`. Before, the app wore the stock Windows
+  `IDI_APPLICATION` icon everywhere.
+- **Branding assets.** `assets/` holds the README wordmark banner, the
+  256 px icon preview and the icon master; the banner opens the README.
+- **`tools/gui-tests/tooltip-test.ps1`** — posted-message headless check
+  that a tooltip is (1) fully inside the window and (2) fully opaque over
+  whatever is behind it (no unchanged pixels inside the rounded box except
+  the corner notches).
+- **`vendor/nuklear/rmdecrypt-nuklear.patch`** captures the whole fork
+  against pristine v4.13.4; verified byte-exact on re-apply. AGENTS.md
+  documents the bump workflow.
+
+### Changed
+
+- **Vendored Nuklear v4.13.3 → v4.13.4.** 12 of 13 fork hunks applied
+  cleanly; the single conflict (tooltip width) merged in our favor —
+  upstream fixed only the width line, our patch also compacts the height
+  and fixes the box shape. Gained upstream fixes: nonblocking-popup
+  `buf.active` leak, font oversampling, utf8 `NUL`/`remove_runes`
+  off-by-one, `global_alpha` applied once per `stroke_poly_line`. The
+  vendored d3d11 backend is byte-identical between the tags.
+- **Tooltip box compacted.** Sized from `popup_padding` only
+  (`TT_PAD_X`/`TT_PAD_Y` in `gui_nk.c`, DPI-scaled) instead of the main
+  window's padding doubled by the popup panel's inset — which made the box
+  fat with a dead gutter on the right — and the row is offset so the text
+  sits vertically centered.
+
+### Fixed
+
+- **Tooltips clipped at window edges.** `nk_tooltip_begin_offset` now
+  clamps the tooltip into the parent panel's visible clip rect, nudging it
+  back the minimum needed so it stays near the cursor but never renders
+  cut off by the HWND.
+- **Tooltip edge slivers and corner tabs.** Dynamic panels never get the
+  rounded body fill; upstream instead painted the box with square fills
+  (a per-row rect in `nk_panel_layout`, edge strips in `nk_panel_end`)
+  that stuck flat tabs out of the rounded border's corner arcs, and the
+  popup's content-rect scissor left unpainted slivers at each end through
+  which the UI behind showed. Tooltips now draw one rounded background —
+  emitted between real scissor commands so it reaches the border — and the
+  square fills are skipped for tooltip panels.
+- Version bumped to 1.5.0 (CLI, GUI title, package manifest).
+- `LICENSE` file added (MIT; matches the README's claim) with attribution
+  to the original RPG-Maker-MV-Decrypter.
+
 ## [1.2.0] - 2026-10-21
 
 GUI release: a redesigned layout, live window resizing, and a scrollbar

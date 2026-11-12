@@ -8,15 +8,20 @@
 
 Decrypt (and re-encrypt) RPG Maker encrypted assets — images, audio, tilesets, and more — from the command line or a native Windows GUI. No browser, Java runtime, or ZIP workflow required. Point it at a game folder and go.
 
-## Version 1.2.0
+## Version 1.5.0
 
-`v1.2.0` is a GUI release: a compact card layout, live window resizing that
-re-lays out continuously (no more black areas while dragging an edge), and a
-rewritten log scrollbar (thumb-only hover, 1:1 drag, faster wheel).
-`v1.1.0` before it brought the shared processing core, several correctness
-and safety fixes (including a `--clean-output` data-loss bug), a ~1.5×
-faster CLI (~2.8× faster than the original JavaScript implementation on
-Node.js) and a ~2.6× faster GUI. See [CHANGELOG.md](CHANGELOG.md).
+`v1.5.0` is a GUI polish release: tooltips stay fully visible at the window
+edges with a compact, correctly rounded box, the window and taskbar get a
+real app icon, the README wears a wordmark banner, and vendored Nuklear
+moved to v4.13.4 with the fork patches kept as a re-applicable patch file.
+The CLI and processing core are unchanged. `v1.2.0` before it was the GUI
+redesign: a compact card layout, live window resizing that re-lays out
+continuously (no more black areas while dragging an edge), and a rewritten
+log scrollbar (thumb-only hover, 1:1 drag, faster wheel). `v1.1.0` brought
+the shared processing core, several correctness and safety fixes (including
+a `--clean-output` data-loss bug), a ~1.5× faster CLI (~2.8× faster than
+the original JavaScript implementation on Node.js) and a ~2.6× faster GUI.
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Features
 
@@ -135,13 +140,14 @@ RPG Maker's built-in encryption is a simple XOR scheme, not a strong cipher:
 
 | Tool | min | median | rmdecrypt is |
 |------|-----|--------|-----------|
-| **rmdecrypt v1.1.0 / v1.2.0** ¹ | **126 ms** | **134 ms** | — |
+| **rmdecrypt v1.1.0 / v1.2.0 / v1.5.0** ¹ | **126 ms** | **134 ms** | — |
 | rmdecrypt v1.0.0 | 188 ms | 197 ms | 1.47× faster |
 | Original JS on Node.js — async, 64 files in flight | 231 ms | 242 ms | 1.81× faster |
 | Original JS on Node.js — synchronous | 339 ms | 370 ms | 2.77× faster |
 
 ¹ Measured with the 1.1.0 build; the CLI and processing core are unchanged
-in 1.2.0 (a GUI-only release).
+in 1.2.0 (a GUI-only release) and 1.5.0 (GUI icon/tooltips and vendored
+Nuklear only).
 
 | GUI self-test (includes window + D3D11 startup) | median |
 |---|---|
