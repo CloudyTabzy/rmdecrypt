@@ -40,6 +40,7 @@ pub fn build(b: *std.Build) void {
     gui.root_module.addIncludePath(b.path("vendor/nuklear"));
     gui.root_module.addCSourceFile(.{ .file = b.path("src/nk_shim.c") });
     gui.root_module.addCSourceFile(.{ .file = b.path("src/gui_nk.c") });
+    gui.root_module.addWin32ResourceFile(.{ .file = b.path("resources/app.rc") });
     gui.root_module.link_libc = true;
     if (target.result.os.tag == .windows) {
         gui.subsystem = .windows;

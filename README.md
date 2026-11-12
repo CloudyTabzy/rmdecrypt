@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo-wordmark.png" alt="rmdecrypt" width="620"/>
+</p>
+
 # rmdecrypt — RPG Maker MV/MZ Asset Decryptor
 
 > A fast, native port of [Petschko's RPG-Maker-MV/MZ Decrypter](https://github.com/Petschko/RPG-Maker-MV-Decrypter) written in Zig 0.16.

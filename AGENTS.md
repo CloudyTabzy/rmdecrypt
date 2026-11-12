@@ -13,6 +13,11 @@ back to their standard formats (`.png`/`.m4a`/`.ogg`) — and vice versa.
 
 ```
 rmdecrypt/
+├── resources/          — Win32 resources: app.rc (IDI_APPICON 101) +
+│                        rmdecrypt.ico (16–256 px, slime-bandit icon; built
+│                        from logo assets by a Pillow pipeline — rebuild the
+│                        ICO, do not hand-edit it)
+├── assets/             — README logo banner + app-icon PNGs
 ├── build.zig           — Build config: CLI, GUI (Nuklear+D3D11), tests, benches
 ├── build.zig.zon       — Package manifest; no external dependencies
 ├── README.md           — User-facing docs with benchmark
@@ -135,6 +140,12 @@ code byte‑identical to upstream Nuklear demo patterns.
 - `gui.zig` — exports `rmd_zig_*` (is_dir, pick_folder, detect_key, scan,
   step, progress, log access) called from C; `main`/`WinMain` forward to
   `rmd_gui_main()`.
+- App icon: `resources/app.rc` embeds `rmdecrypt.ico` as `IDI_APPICON` **101**;
+  `nk_shim.c` registers a `WNDCLASSEX` and loads 101 for `hIcon` (title bar /
+  taskbar) plus a real 16 px `hIconSm` via `LoadImageW`. Keep the resource ID
+  in sync between the two files. Zig compiles the `.rc` with
+  `addWin32ResourceFile` — it pre-defines `_WIN32_WINNT`, which `nk_shim.c`
+  guards with `#ifndef`.
 
 Layout (`draw()` in `gui_nk.c`): header row, then rounded **cards**
 (Nuklear groups with `NK_WINDOW_BORDER | NK_WINDOW_NO_SCROLLBAR`) for

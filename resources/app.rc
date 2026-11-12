@@ -1,0 +1,8 @@
+// resources/app.rc — Win32 resources for rmdecrypt-gui.
+// The icon is the slime-bandit app icon (see logo-candidates notes);
+// IDI_APPICON must stay in sync with nk_shim.c.
+#include <windows.h>
+
+#define IDI_APPICON 101
+
+IDI_APPICON ICON "rmdecrypt.ico"

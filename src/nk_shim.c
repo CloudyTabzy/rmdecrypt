@@ -9,9 +9,15 @@
  * MUST match the cImport config in gui.zig (ABI mismatch otherwise).
  */
 
-/* Target Windows 10 for SetProcessDpiAwarenessContext / GetDpiForWindow. */
+/* Target Windows 10 for SetProcessDpiAwarenessContext / GetDpiForWindow.
+ * Guarded: Zig's resource/compiler driver may already set these on the
+ * command line, and a bare redefinition is an error. */
+#ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
+#endif
+#ifndef NTDDI_VERSION
 #define NTDDI_VERSION 0x0A000000
+#endif
 
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS
@@ -251,7 +257,7 @@ set_swap_chain_size(int width, int height)
 struct nk_context *
 nkshim_init(int width, int height, const char *title)
 {
-    WNDCLASSW wc;
+    WNDCLASSEXW wc;
     RECT rect = {0, 0, WINDOW_WIDTH, WINDOW_HEIGHT};
     DWORD style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
     DWORD exstyle = WS_EX_APPWINDOW;
@@ -272,13 +278,25 @@ nkshim_init(int width, int height, const char *title)
 #endif
 
     memset(&wc, 0, sizeof(wc));
+    wc.cbSize = sizeof(wc);
     wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = GetModuleHandleW(NULL);
-    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    /* App icon from resources/app.rc (IDI_APPICON 101); fall back to the
+     * stock app icon if the resource is missing (e.g. non-Windows cross
+     * builds, where the .rc is ignored). Large slot for the title bar /
+     * taskbar, and a real 16px LoadImage for hIconSm instead of the
+     * shrunk-down default. */
+    wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(101));
+    if (!wc.hIcon)
+        wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hIconSm = (HICON)(LONG_PTR)LoadImageW(wc.hInstance, MAKEINTRESOURCEW(101),
+        IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+    if (!wc.hIconSm)
+        wc.hIconSm = wc.hIcon;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.lpszClassName = L"rmdecrypt";
-    RegisterClassW(&wc);
+    RegisterClassExW(&wc);
 
     AdjustWindowRectEx(&rect, style, FALSE, exstyle);
     MultiByteToWideChar(CP_UTF8, 0, title, -1, wtitle, (int)(sizeof(wtitle) / sizeof(wtitle[0])));
